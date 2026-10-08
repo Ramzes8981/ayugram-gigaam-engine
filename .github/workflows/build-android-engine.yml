@@ -1,0 +1,24 @@
+name: Build GigaAM Android engine
+on:
+  workflow_dispatch:
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Android NDK and Ninja
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake
+          echo "ANDROID_NDK_HOME=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)" >> "$GITHUB_ENV"
+      - name: Compile transcribe.cpp + ggml for Android arm64
+        run: bash scripts/build-android-engine.sh
+      - name: Upload Android shared objects
+        uses: actions/upload-artifact@v4
+        with:
+          name: ayugram-transcribe-android-arm64
+          path: android-engine-arm64/
+          if-no-files-found: error
+          retention-days: 10
