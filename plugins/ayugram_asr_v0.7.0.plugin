@@ -1,0 +1,2283 @@
+"""AyuGram ASR 0.7.0: simple offline transcription and rootless engine setup.
+
+Targets AyuGram for Android 12.10.6 / exteraGram Plugin SDK >= 1.4.4.3.
+
+This build provides a real GigaAM ctypes inference path, Android Opus decoding,
+GGUF model downloading and a rootless GitHub Releases engine installer.
+Until a valid engine is installed, original Vosk remains unchanged.
+No paths, message IDs, chat IDs, audio contents or transcript text are logged.
+"""
+import base64
+import ctypes
+import hashlib
+import os
+import platform
+import struct
+import threading
+from collections import deque
+import zipfile
+import time
+import array
+import io
+import sys
+import json
+import re
+import urllib.request
+import urllib.error
+import socket
+import http.client
+
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from ui.settings import Header, Switch, Text, Input, Selector
+from android_utils import run_on_ui_thread
+
+__id__ = "ayugram_asr_probe"
+__name__ = "AyuGram ASR"
+__description__ = "Локальная расшифровка и установка движка без root"
+__author__ = "AyuGram ASR"
+__version__ = "0.7.0"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+TEST_TEXT = "[ASR PROBE] Перехват работает. Это тестовый текст, аудио не распознавалось."
+MONITOR_INTERVAL = 1.0
+MAX_PENDING_ASR = 8
+MAX_QUEUE_WAIT_SEC = 180
+MONITOR_DEADLINE_SEC = 600
+MEGABYTE = 1024.0 * 1024.0
+
+NATIVE_LIB_SHA256 = '206d2b6702a0789b14b93e98b30e5bc143f9c575d8b8080c98c46d0d3c1bbca3'
+NATIVE_LIB_BASE64 = 'f0VMRgIBAQAAAAAAAAAAAAMAtwABAAAAAAAAAAAAAABAAAAAAAAAAIAGAAAAAAAAAAAAAEAAOAAIAEAADwANAAYAAAAEAAAAQAAAAAAAAABAAAAAAAAAAEAAAAAAAAAAwAEAAAAAAADAAQAAAAAAAAgAAAAAAAAAAQAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8AwAAAAAAADwDAAAAAAAAAEAAAAAAAAABAAAABQAAADwDAAAAAAAAPEMAAAAAAAA8QwAAAAAAABgAAAAAAAAAGAAAAAAAAAAAQAAAAAAAAAEAAAAGAAAAWAMAAAAAAABYgwAAAAAAAFiDAAAAAAAAoAAAAAAAAACoDAAAAAAAAABAAAAAAAAAAgAAAAYAAABYAwAAAAAAAFiDAAAAAAAAWIMAAAAAAACgAAAAAAAAAKAAAAAAAAAACAAAAAAAAABS5XRkBAAAAFgDAAAAAAAAWIMAAAAAAABYgwAAAAAAAKAAAAAAAAAAqAwAAAAAAAABAAAAAAAAAFDldGQEAAAA2AIAAAAAAADYAgAAAAAAANgCAAAAAAAAHAAAAAAAAAAcAAAAAAAAAAQAAAAAAAAAUeV0ZAYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAEgAIADxDAAAAAAAADAAAAAAAAAASAAAAEgAIAEhDAAAAAAAADAAAAAAAAAABAAAAAQAAAAEAAAAaAAAAAACAAgAAAgABAAAAsKT+ZJeqZWYDAAAAAwAAAAIAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAABhc3JfcHJvYmVfYW5zd2VyAGFzcl9wcm9iZV9iYW5uZXIAbGliYXNyX3Byb2JlLnNvAEFZVUdSQU1fTkFUSVZFX1BST0JFX09LAAABGwM7HAAAAAIAAABkQAAANAAAAHBAAABIAAAAAAAAABAAAAAAAAAAAXpSAAF8HgEbDB8AEAAAABgAAAAoQAAADAAAAAAAAAAUAAAALAAAACBAAAAMAAAAAAAAAAAAAAAAAAAAABKFUqAmoHLAA1/WHyAD1YD7/XDAA1/WAAAAAA4AAAAAAAAAIwAAAAAAAAAeAAAAAAAAAAgAAAAAAAAA+///bwAAAAABAAAAAAAAAAYAAAAAAAAAAAIAAAAAAAALAAAAAAAAABgAAAAAAAAABQAAAAAAAACMAgAAAAAAAAoAAAAAAAAAMwAAAAAAAAD1/v9vAAAAAEgCAAAAAAAABAAAAAAAAABsAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY2xhbmcgdmVyc2lvbiAxNy4wLjAgKGh0dHBzOi8vZ2l0aHViLmNvbS9zd2lmdGxhbmcvbGx2bS1wcm9qZWN0LmdpdCAxMDk5OWI2ZDAzNGZlMzE4ZjNkNTZjODNiZGRiNjU3MjU5M2E4YmIwKQBMaW5rZXI6IExMRCAxNy4wLjAgKGh0dHBzOi8vZ2l0aHViLmNvbS9zd2lmdGxhbmcvbGx2bS1wcm9qZWN0LmdpdCAxMDk5OWI2ZDAzNGZlMzE4ZjNkNTZjODNiZGRiNjU3MjU5M2E4YmIwKQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAEAPH/AAAAAAAAAAAAAAAAAAAAABAAAAAAAAgAPEMAAAAAAAAAAAAAAAAAABMAAAAAAAUAvwIAAAAAAAAAAAAAAAAAABYAAAAAAAsAAAAAAAAAAAAAAAAAAAAAABkAAAAAAAcA+AIAAAAAAAAAAAAAAAAAAD4AAAAAAgkAWIMAAAAAAAAAAAAAAAAAABwAAAASAAgAPEMAAAAAAAAMAAAAAAAAAC0AAAASAAgASEMAAAAAAAAMAAAAAAAAAAAuZHluc3ltAC5nbnUuaGFzaAAuaGFzaAAuZHluc3RyAC5yb2RhdGEALmVoX2ZyYW1lX2hkcgAuZWhfZnJhbWUALnRleHQALmR5bmFtaWMALnJlbHJvX3BhZGRpbmcALmNvbW1lbnQALnN5bXRhYgAuc2hzdHJ0YWIALnN0cnRhYgAAbmF0aXZlX3Byb2JlLmMAJHgAJGQAJGQAJGQAYXNyX3Byb2JlX2Fuc3dlcgBhc3JfcHJvYmVfYmFubmVyAF9EWU5BTUlDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAsAAAACAAAAAAAAAAACAAAAAAAAAAIAAAAAAABIAAAAAAAAAAQAAAABAAAACAAAAAAAAAAYAAAAAAAAAAkAAAD2//9vAgAAAAAAAABIAgAAAAAAAEgCAAAAAAAAJAAAAAAAAAABAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAATAAAABQAAAAIAAAAAAAAAbAIAAAAAAABsAgAAAAAAACAAAAAAAAAAAQAAAAAAAAAEAAAAAAAAAAQAAAAAAAAAGQAAAAMAAAACAAAAAAAAAIwCAAAAAAAAjAIAAAAAAAAzAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAACEAAAABAAAAMgAAAAAAAAC/AgAAAAAAAL8CAAAAAAAAGAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAQAAAAAAAAApAAAAAQAAAAIAAAAAAAAA2AIAAAAAAADYAgAAAAAAABwAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAANwAAAAEAAAACAAAAAAAAAPgCAAAAAAAA+AIAAAAAAABEAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAEEAAAABAAAABgAAAAAAAAA8QwAAAAAAADwDAAAAAAAAGAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAABHAAAABgAAAAMAAAAAAAAAWIMAAAAAAABYAwAAAAAAAKAAAAAAAAAABAAAAAAAAAAIAAAAAAAAABAAAAAAAAAAUAAAAAgAAAADAAAAAAAAAPiDAAAAAAAA+AMAAAAAAAAIDAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAF8AAAABAAAAMAAAAAAAAAAAAAAAAAAAAPgDAAAAAAAA2wAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAQAAAAAAAABoAAAAAgAAAAAAAAAAAAAAAAAAAAAAAADYBAAAAAAAANgAAAAAAAAADgAAAAcAAAAIAAAAAAAAABgAAAAAAAAAcAAAAAMAAAAAAAAAAAAAAAAAAAAAAAAAsAUAAAAAAACCAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAHoAAAADAAAAAAAAAAAAAAAAAAAAAAAAADIGAAAAAAAARwAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAA='
+
+
+def _monotonic():
+    return time.monotonic()
+
+
+def _process_cpu():
+    return time.process_time()
+
+
+def _short_exc(e):
+    # Avoid including arbitrary paths / audio data from exception messages.
+    return type(e).__name__
+
+
+def _kb_from_proc_status():
+    result = {}
+    with open('/proc/self/status', 'r') as f:
+        for row in f:
+            if row.startswith(('VmRSS:', 'VmHWM:', 'VmSize:', 'VmSwap:', 'Threads:')):
+                key, value = row.split(':', 1)
+                tokens = value.split()
+                if tokens:
+                    try:
+                        result[key] = int(tokens[0])
+                    except ValueError:
+                        pass
+    return result
+
+
+def _pss_kb():
+    # Usually readable for own PID, but denied on some vendor kernels.
+    try:
+        with open('/proc/self/smaps_rollup', 'r') as f:
+            for row in f:
+                if row.startswith('Pss:'):
+                    return int(row.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _available_ram_kb():
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for row in f:
+                if row.startswith('MemAvailable:'):
+                    return int(row.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _android_power():
+    """Best-effort telemetry; never fails a transcription if device hides it."""
+    out = {}
+    try:
+        from org.telegram.messenger import ApplicationLoader
+        ctx = ApplicationLoader.applicationContext
+        if ctx is None:
+            return out
+        try:
+            battery = ctx.getSystemService('batterymanager')
+            if battery is not None:
+                from android.os import BatteryManager
+                val = int(battery.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY))
+                if 0 <= val <= 100:
+                    out['battery_pct'] = val
+        except Exception:
+            pass
+        try:
+            pm = ctx.getSystemService('power')
+            if pm is not None:
+                # API 29+. Value is thermal *status*, not temperature in Celsius.
+                out['thermal_status'] = int(pm.getCurrentThermalStatus())
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return out
+
+
+def _memory_sample(include_pss=False, include_system=False, include_power=False):
+    row = {'mono': _monotonic(), 'cpu': _process_cpu()}
+    try:
+        d = _kb_from_proc_status()
+        row['rss_mb'] = round(d.get('VmRSS', 0) / 1024.0, 1) if 'VmRSS' in d else None
+        row['hwm_mb'] = round(d.get('VmHWM', 0) / 1024.0, 1) if 'VmHWM' in d else None
+        row['vms_mb'] = round(d.get('VmSize', 0) / 1024.0, 1) if 'VmSize' in d else None
+        row['swap_mb'] = round(d.get('VmSwap', 0) / 1024.0, 1) if 'VmSwap' in d else None
+        row['threads'] = d.get('Threads')
+    except Exception:
+        row.update(rss_mb=None, hwm_mb=None, vms_mb=None, swap_mb=None, threads=None)
+    if include_pss:
+        pss = _pss_kb()
+        row['pss_mb'] = round(pss / 1024.0, 1) if pss is not None else None
+    if include_system:
+        available = _available_ram_kb()
+        row['sys_available_mb'] = round(available / 1024.0, 1) if available is not None else None
+    if include_power:
+        row.update(_android_power())
+    return row
+
+
+def _fmt(data):
+    return ' '.join('%s=%s' % (k, v) for k, v in data.items() if v is not None)
+
+
+def _audio_duration_ms(path):
+    # Android built-in MediaMetadataRetriever supports the original OGG/OPUS.
+    # It may still fail depending on vendor firmware / file state.
+    retriever = None
+    try:
+        from android.media import MediaMetadataRetriever
+        retriever = MediaMetadataRetriever()
+        retriever.setDataSource(path)
+        value = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+        return int(str(value)) if value else None
+    except Exception:
+        return None
+    finally:
+        if retriever is not None:
+            try:
+                retriever.release()
+            except Exception:
+                pass
+
+
+MODEL_CATALOG = {
+    'ctc': {'name': 'GigaAM E2E CTC Q4', 'repo': 'handy-computer/gigaam-v3-e2e-ctc-gguf',
+            'file': 'gigaam-v3-e2e-ctc-Q4_K_M.gguf', 'min_mb': 160, 'max_mb': 195,
+            'sha256': '35581e11e048eef785657cff07e5fced794bba6d9c75143257f6452c8aeea655',
+            'whisper': False},
+    'rnnt': {'name': 'GigaAM E2E RNNT Q4', 'repo': 'handy-computer/gigaam-v3-e2e-rnnt-gguf',
+             'file': 'gigaam-v3-e2e-rnnt-Q4_K_M.gguf', 'min_mb': 170, 'max_mb': 205,
+             'sha256': None, 'whisper': False},
+    'whisper': {'name': 'Whisper Large v3 Q4', 'repo': 'handy-computer/whisper-large-v3-gguf',
+                'file': 'whisper-large-v3-Q4_K_M.gguf', 'min_mb': 900, 'max_mb': 1030,
+                'sha256': None, 'whisper': True},
+}
+MODEL_ORDER = ('ctc','rnnt','whisper')
+MODEL_URL = 'https://huggingface.co/handy-computer/gigaam-v3-e2e-ctc-gguf/resolve/main/gigaam-v3-e2e-ctc-Q4_K_M.gguf'
+MODEL_SHA256 = MODEL_CATALOG['ctc']['sha256']
+MODEL_NAME = MODEL_CATALOG['ctc']['file']
+MODEL_MIN_BYTES = 150 * 1024 * 1024
+MODEL_MAX_BYTES = 240 * 1024 * 1024
+
+
+MAX_AUDIO_SECS = 300
+CHUNK_SECS = 20
+SAMPLE_RATE = 16000
+
+
+def _context_files_dir():
+    from org.telegram.messenger import ApplicationLoader
+    ctx = ApplicationLoader.applicationContext
+    if ctx is None:
+        raise RuntimeError('app_context_null')
+    return str(ctx.getFilesDir().getAbsolutePath())
+
+
+def _default_model_file(model_id='ctc'):
+    return os.path.join(_context_files_dir(), 'asr_gigaam', MODEL_CATALOG[model_id]['file'])
+
+
+def _model_id_for_path(path):
+    filename = os.path.basename(path)
+    for key, spec in MODEL_CATALOG.items():
+        if spec['file'] == filename:
+            return key
+    raise ValueError('unknown_model_filename')
+
+
+def _model_expected_sha(path):
+    """Previously pinned SHA, or sidecar obtained from publisher's HTTPS LFS API."""
+    model_id = _model_id_for_path(path)
+    fixed = MODEL_CATALOG[model_id]['sha256']
+    if fixed:
+        return fixed
+    sidecar = path + '.sha256'
+    with open(sidecar, 'r', encoding='ascii') as fp:
+        raw = fp.read(100).strip().lower()
+    if not re.fullmatch(r'[0-9a-f]{64}', raw):
+        raise ValueError('model_sha_sidecar_invalid')
+    return raw
+
+
+def _publisher_lfs_sha(model_id):
+    """Retrieve HF LFS oid from specified publisher over TLS. Not an independent signature."""
+    spec = MODEL_CATALOG[model_id]
+    url = 'https://huggingface.co/api/models/' + spec['repo'] + '/tree/main?expand=true'
+    request = urllib.request.Request(url, headers={'User-Agent':'AyuGramASRLab/0.6.2'})
+    with urllib.request.urlopen(request, timeout=35) as response:
+        data = response.read(1024 * 1024 + 1)
+    if len(data) > 1024 * 1024:
+        raise ValueError('hf_metadata_too_large')
+    for entry in json.loads(data.decode('utf-8')):
+        if entry.get('path') == spec['file']:
+            oid = str((entry.get('lfs') or {}).get('oid') or '').lower()
+            if oid.startswith('sha256:'):
+                oid = oid[7:]
+            if re.fullmatch(r'[0-9a-f]{64}', oid):
+                return oid
+    raise ValueError('hf_lfs_sha256_unavailable')
+
+
+
+ENGINE_REPOSITORY = 'Ramzes8981/ayugram-gigaam-engine'
+ENGINE_TAG = 'engine-v1.0.0'
+ENGINE_UPSTREAM_COMMIT = '95d82e5134fba4b18ad6a46f3baf950f53bcfc3b'
+ENGINE_ASSET = 'engine-arm64-v8a.zip'
+ENGINE_ARCHIVE_SHA256 = '8f310e6c89e924550715e4d16a5459478999bbee707d546f102a66ccbeeb55e9'
+ENGINE_RELEASE_URL = ('https://github.com/' + ENGINE_REPOSITORY +
+                      '/releases/download/' + ENGINE_TAG + '/' + ENGINE_ASSET)
+ENGINE_ALLOWED_SO = ('libtranscribe.so', 'libggml-base.so', 'libggml-cpu.so', 'libggml.so')
+ENGINE_ARCHIVE_MAX = 80 * 1024 * 1024
+ENGINE_EXPANDED_MAX = 120 * 1024 * 1024
+
+
+def _engine_root():
+    from org.telegram.messenger import ApplicationLoader
+    ctx = ApplicationLoader.applicationContext
+    if ctx is None:
+        raise RuntimeError('app_context_null')
+    return os.path.join(str(ctx.getCodeCacheDir().getAbsolutePath()), 'asr_engine')
+
+
+def _default_engine_file():
+    root = _engine_root()
+    try:
+        with open(os.path.join(root, 'installed.json'), encoding='utf-8') as stream:
+            marker = json.load(stream)
+        name = marker.get('directory', '')
+        # Reject malformed or user-controlled filesystem paths.
+        if (marker.get('version') == ENGINE_TAG and
+                re.fullmatch(r'engine-v1\.0\.0-[0-9a-f]{12}', name)):
+            filename = os.path.join(root, name, 'libtranscribe.so')
+            if os.path.isfile(filename):
+                return filename
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return os.path.join(root, 'libtranscribe.so')
+
+
+def _engine_current_version():
+    path = _default_engine_file()
+    if not os.path.isfile(path):
+        return 'Не установлен'
+    return ENGINE_TAG if os.path.dirname(path) != _engine_root() else 'Ручная установка'
+
+
+def _read_release_sha256(url):
+    request = urllib.request.Request(url + '.sha256', headers={
+        'User-Agent': 'AyuGramASR/0.7.0', 'Accept': 'text/plain'})
+    with urllib.request.urlopen(request, timeout=35) as response:
+        if not response.geturl().startswith('https://'):
+            raise ValueError('non_https_redirect')
+        text = response.read(512).decode('ascii', 'strict').strip()
+    match = re.fullmatch(r'([0-9a-fA-F]{64})\s+\*?engine-arm64-v8a\.zip', text)
+    if match is None:
+        raise ValueError('engine_digest_format_invalid')
+    digest = match.group(1).lower()
+    if digest != ENGINE_ARCHIVE_SHA256:
+        raise ValueError('release_digest_differs_from_pinned_build')
+    return digest
+
+
+def _download_engine_archive(url, path, expected, notify=None):
+    # Download only from pinned version URL; verify digest before extracting.
+    part = path + '.part'
+    if os.path.isfile(path) and _checksum(path) == expected:
+        return path
+    for attempt in range(1, 5):
+        existing = os.path.getsize(part) if os.path.isfile(part) else 0
+        if existing > ENGINE_ARCHIVE_MAX:
+            os.unlink(part)
+            existing = 0
+        headers = {'User-Agent': 'AyuGramASR/0.7.0',
+                   'Accept-Encoding': 'identity'}
+        if existing:
+            headers['Range'] = 'bytes=%d-' % existing
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=70) as resp:
+                if not resp.geturl().startswith('https://'):
+                    raise ValueError('non_https_redirect')
+                status = resp.getcode()
+                content_range = resp.headers.get('Content-Range', '')
+                append = bool(existing and status == 206 and
+                              content_range.startswith('bytes %d-' % existing))
+                if status == 206 and existing and not append:
+                    raise ValueError('unexpected_range_response')
+                if status not in (200, 206):
+                    raise ValueError('unexpected_http_status_%s' % status)
+                position = existing if append else 0
+                with open(part, 'ab' if append else 'wb') as dest:
+                    while True:
+                        data = resp.read(256 * 1024)
+                        if not data:
+                            break
+                        position += len(data)
+                        if position > ENGINE_ARCHIVE_MAX:
+                            raise ValueError('engine_archive_too_large')
+                        dest.write(data)
+                        if notify:
+                            notify('Скачивание движка: %.1f МиБ' % (position / 1048576))
+                    dest.flush()
+                    os.fsync(dest.fileno())
+            if notify:
+                notify('Проверка контрольной суммы…')
+            if _checksum(part) != expected:
+                os.unlink(part)
+                raise ValueError('engine_archive_sha256_mismatch')
+            os.replace(part, path)
+            return path
+        except (OSError, urllib.error.URLError, http.client.HTTPException, socket.timeout):
+            if attempt == 4:
+                raise
+            time.sleep(min(attempt, 3))
+    raise RuntimeError('engine_download_unavailable')
+
+
+def _install_engine_archive(archive, root, expected, notify=None, load_validator=None):
+    """Validate all members and hashes; never overwrite a loaded shared object."""
+    if _checksum(archive) != expected:
+        raise ValueError('archive_checksum_mismatch')
+    version_dir = ENGINE_TAG + '-' + expected[:12]
+    target = os.path.join(root, version_dir)
+    stage = os.path.join(root, '.install-' + expected[:12])
+    allowed = set(ENGINE_ALLOWED_SO) | {'SHA256SUMS', 'VERSION.txt'}
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    if os.path.isdir(stage):
+        # The staging directory is never used by the runtime.
+        import shutil
+        shutil.rmtree(stage)
+    os.mkdir(stage, 0o700)
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            info = zf.infolist()
+            names = [m.filename for m in info]
+            if (len(names) != len(set(names)) or not names or
+                    set(names) - allowed or 'libtranscribe.so' not in names or
+                    'SHA256SUMS' not in names or 'VERSION.txt' not in names):
+                raise ValueError('unexpected_engine_archive_contents')
+            total = 0
+            for member in info:
+                if member.is_dir() or member.file_size > 50 * 1024 * 1024:
+                    raise ValueError('unsupported_engine_zip_member')
+                # Forbid symlinks and other special Unix entries.
+                mode = (member.external_attr >> 16) & 0o170000
+                if mode not in (0, 0o100000):
+                    raise ValueError('engine_zip_special_file')
+                total += member.file_size
+            if total > ENGINE_EXPANDED_MAX:
+                raise ValueError('engine_extracted_size_limit')
+            checksums = zf.read('SHA256SUMS').decode('ascii', 'strict')
+            expected_files = {}
+            for row in checksums.splitlines():
+                pair = row.strip().split()
+                if len(pair) != 2 or not re.fullmatch('[0-9a-fA-F]{64}', pair[0]):
+                    raise ValueError('engine_internal_manifest_invalid')
+                filename = pair[1].lstrip('*').removeprefix('./')
+                if filename not in ENGINE_ALLOWED_SO or filename in expected_files:
+                    raise ValueError('engine_internal_manifest_unexpected')
+                expected_files[filename] = pair[0].lower()
+            so_files = set(names) & set(ENGINE_ALLOWED_SO)
+            if so_files != set(expected_files):
+                raise ValueError('engine_manifest_missing_file')
+            version = zf.read('VERSION.txt').decode('ascii', 'strict')
+            if ENGINE_UPSTREAM_COMMIT not in version or 'arm64-v8a' not in version:
+                raise ValueError('engine_upstream_version_mismatch')
+            for name in names:
+                dest = os.path.join(stage, name)
+                with zf.open(name) as source, open(dest, 'wb') as out:
+                    while True:
+                        chunk = source.read(256 * 1024)
+                        if not chunk: break
+                        out.write(chunk)
+                    out.flush()
+                    os.fsync(out.fileno())
+                if name.endswith('.so'):
+                    if _checksum(dest) != expected_files[name]:
+                        raise ValueError('engine_library_sha256_mismatch')
+                    with open(dest, 'rb') as lib:
+                        header = lib.read(20)
+                    if not (len(header) == 20 and header[:4] == b'\x7fELF' and
+                            header[4] == 2 and header[5] == 1 and
+                            header[18:20] == b'\xb7\x00'):
+                        raise ValueError('engine_not_arm64_elf')
+                os.chmod(dest, 0o400)
+                if notify:
+                    notify('Подготовка: ' + name)
+        if not os.path.isdir(target):
+            os.replace(stage, target)
+        else:
+            # If already installed, only accept the exact same library bytes.
+            for name, digest in expected_files.items():
+                file = os.path.join(target, name)
+                if not os.path.isfile(file) or _checksum(file) != digest:
+                    raise ValueError('installed_engine_conflict')
+        native_lib = os.path.join(target, 'libtranscribe.so')
+        if load_validator is not None:
+            load_validator(native_lib)
+        marker = {'version': ENGINE_TAG, 'directory': version_dir,
+                  'archive_sha256': expected}
+        meta = os.path.join(root, '.installed.json.tmp')
+        with open(meta, 'w', encoding='utf-8') as dest:
+            json.dump(marker, dest, sort_keys=True)
+            dest.flush()
+            os.fsync(dest.fileno())
+        os.chmod(meta, 0o600)
+        os.replace(meta, os.path.join(root, 'installed.json'))
+        return os.path.join(target, 'libtranscribe.so')
+    finally:
+        if os.path.isdir(stage):
+            import shutil
+            shutil.rmtree(stage)
+
+
+
+def _checksum(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as fp:
+        while True:
+            data = fp.read(1024 * 1024)
+            if not data:
+                break
+            h.update(data)
+    return h.hexdigest()
+
+
+def _verify_model(path, full_hash=False):
+    spec = MODEL_CATALOG[_model_id_for_path(path)]
+    size = os.stat(path).st_size
+    if not (spec['min_mb']*1048576 <= size <= spec['max_mb']*1048576):
+        raise ValueError('model_size_mismatch')
+    with open(path, 'rb') as f:
+        if f.read(4) != b'GGUF':
+            raise ValueError('not_gguf')
+    if full_hash and _checksum(path) != _model_expected_sha(path):
+        raise ValueError('model_sha256_mismatch')
+    return size
+
+
+def _download_model(logger, path, notify=None):
+    """Resume HTTPS GGUF downloads using verified HTTP byte ranges.
+
+    A timeout/network error never removes a valid .part. Each request uses
+    Range: bytes=<part-size>- and accepts append only for a matching 206
+    Content-Range. A server's 200 response restarts the file from zero;
+    concatenation in that case would silently corrupt GGUF.
+
+    The GGUF is exposed at the final path ONLY after a full SHA-256 check.
+    """
+    model_id = _model_id_for_path(path)
+    spec = MODEL_CATALOG[model_id]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.isfile(path):
+        size = _verify_model(path, full_hash=True)
+        logger.info('ASR_MODEL_READY model=%s cached=1 bytes=%s sha256=PASS', model_id, size)
+        if notify: notify('Модель проверена: SHA-256 OK')
+        return path
+
+    expected = spec['sha256'] or _publisher_lfs_sha(model_id)
+    url = 'https://huggingface.co/' + spec['repo'] + '/resolve/main/' + spec['file']
+    tmp = path + '.part'
+    cap = int(spec['max_mb'] * 1048576)
+    minimum = int(spec['min_mb'] * 1048576)
+    max_attempts = 7
+    chunk_bytes = 256 * 1024
+    started = time.monotonic()
+
+    def progress(n_bytes, total_bytes=None):
+        if notify:
+            mb = n_bytes / 1048576
+            if total_bytes:
+                notify('Загружено %.1f из %.1f МиБ' % (mb, total_bytes / 1048576))
+            else:
+                notify('Загружено %.1f МиБ' % mb)
+
+    def finish():
+        size = os.stat(tmp).st_size
+        if not minimum <= size <= cap:
+            raise ValueError('model_download_size_mismatch')
+        with open(tmp, 'rb') as f:
+            if f.read(4) != b'GGUF':
+                raise ValueError('not_gguf')
+        if notify: notify('Проверка SHA-256 (%.0f МиБ)…' % (size / 1048576))
+        if _checksum(tmp) != expected:
+            # Never make an invalid .part the active model. Corruption is not
+            # a transient network error; retaining this file cannot help.
+            try: os.remove(tmp)
+            except OSError: pass
+            raise ValueError('model_download_sha256_mismatch')
+        # Save the publisher digest before publishing the new model file.
+        if not spec['sha256']:
+            side_tmp = path + '.sha256.tmp'
+            with open(side_tmp, 'w', encoding='ascii') as f:
+                f.write(expected + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(side_tmp, path + '.sha256')
+        os.replace(tmp, path)
+        logger.info('ASR_MODEL_DOWNLOAD_DONE model=%s bytes=%s wall_ms=%s verified_sha256=True',
+                    model_id, size, round(1000*(time.monotonic()-started)))
+        if notify: notify('Модель проверена: SHA-256 OK')
+        return path
+
+    if os.path.isfile(tmp):
+        previous = os.stat(tmp).st_size
+        if previous > cap:
+            raise ValueError('model_partial_size_limit')
+        # The previous run may have completed but crashed before the rename.
+        if previous >= minimum and _checksum(tmp) == expected:
+            logger.info('ASR_MODEL_RESUME_ALREADY_COMPLETE model=%s bytes=%s', model_id, previous)
+            return finish()
+        if previous:
+            logger.info('ASR_MODEL_RESUME model=%s from_bytes=%s', model_id, previous)
+            progress(previous)
+
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        offset = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
+        if offset > cap:
+            raise ValueError('model_partial_size_limit')
+        headers = {'User-Agent': 'AyuGramASRLab/0.6.2', 'Accept-Encoding': 'identity'}
+        if offset:
+            headers['Range'] = 'bytes=%d-' % offset
+        logger.info('ASR_MODEL_HTTP_BEGIN model=%s attempt=%s/%s from_bytes=%s',
+                    model_id, attempt, max_attempts, offset)
+        response_total = None
+        stream_expected = None
+        stream_received = 0
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            # 120 s is a socket inactivity timeout, not a global 1 GB timer.
+            with urllib.request.urlopen(request, timeout=120) as response:
+                status = getattr(response, 'status', None)
+                if status is None:
+                    code = getattr(response, 'getcode', None)
+                    status = code() if code else 200
+                status = status or 200
+                rh = getattr(response, 'headers', None) or {}
+                encoding = (rh.get('Content-Encoding') or 'identity').lower()
+                if encoding not in ('identity', ''):
+                    raise ValueError('http_compression_unsupported')
+                content_length = rh.get('Content-Length')
+                if status == 206:
+                    cr = rh.get('Content-Range') or ''
+                    match = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)', cr.strip())
+                    if not match:
+                        raise ValueError('http_missing_content_range')
+                    start, end, length = map(int, match.groups())
+                    if start != offset or end < start or end >= length:
+                        raise ValueError('http_range_mismatch')
+                    if length > cap:
+                        raise ValueError('model_download_size_limit')
+                    response_total = length
+                    stream_expected = end - start + 1
+                    if content_length is not None and int(content_length) != stream_expected:
+                        raise ValueError('http_content_length_mismatch')
+                    mode = 'ab'
+                elif status == 200:
+                    if offset:
+                        logger.warning('ASR_MODEL_RANGE_IGNORED model=%s old_bytes=%s restart=1', model_id, offset)
+                        if notify: notify('Сервер не поддержал докачку — загрузка с начала')
+                    mode = 'wb'
+                    offset = 0
+                    if content_length is not None:
+                        response_total = int(content_length)
+                        stream_expected = response_total
+                        if response_total > cap:
+                            raise ValueError('model_download_size_limit')
+                else:
+                    raise ValueError('unexpected_http_status_%s' % status)
+                if response_total and response_total < minimum:
+                    raise ValueError('model_download_too_small')
+
+                with open(tmp, mode) as out:
+                    last_report = offset // (8 * 1048576)
+                    while True:
+                        block = response.read(chunk_bytes)
+                        if not block:
+                            break
+                        stream_received += len(block)
+                        size_now = offset + stream_received
+                        if size_now > cap or (response_total and size_now > response_total):
+                            raise ValueError('model_download_size_limit')
+                        out.write(block)
+                        report = size_now // (8 * 1048576)
+                        if report > last_report:
+                            last_report = report
+                            progress(size_now, response_total)
+                    out.flush()
+                    os.fsync(out.fileno())
+
+            size_now = os.path.getsize(tmp)
+            if stream_expected is not None and stream_received != stream_expected:
+                raise OSError('incomplete_http_body')
+            if response_total is not None and size_now < response_total:
+                # A server may cap range length; request the rest next.
+                logger.info('ASR_MODEL_HTTP_MORE model=%s bytes=%s expected=%s', model_id, size_now, response_total)
+                progress(size_now, response_total)
+                continue
+            if response_total is None and size_now < minimum:
+                # Unknown length, possibly a clean disconnect mid-object.
+                raise OSError('model_download_incomplete_without_length')
+            return finish()
+        except urllib.error.HTTPError as e:
+            # HTTP 4xx errors other than timeouts/rate limits are not transient.
+            if e.code not in (408, 425, 429, 500, 502, 503, 504):
+                raise
+            last_error = e
+        except (OSError, urllib.error.URLError, http.client.IncompleteRead,
+                ConnectionError, TimeoutError, socket.timeout) as e:
+            last_error = e
+        # Partial contents are intentionally preserved, also after exhausting
+        # retries. On the next attempt / tap, Range resumes from this point.
+        saved = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
+        logger.warning('ASR_MODEL_HTTP_RETRY model=%s attempt=%s saved_bytes=%s reason=%s',
+                       model_id, attempt, saved, _short_exc(last_error))
+        if notify: notify('Сбой сети; сохранено %.1f МиБ, попытка %s/%s' %
+                          (saved / 1048576, attempt, max_attempts))
+        if attempt < max_attempts:
+            time.sleep(min(2 ** (attempt - 1), 8))
+    raise ConnectionError('model_download_retries_exhausted') from last_error
+
+
+def _pcm16_resample(raw_bytes, channels, src_rate):
+    """Android PCM s16 LE -> float32 mono 16k. Optional fast audioop path.
+
+    Fallback is pure Python linear interpolation, compatible with 8/16/24/44.1/48k.
+    """
+    if not raw_bytes:
+        return array.array('f')
+    if channels < 1 or channels > 8 or src_rate < 8000 or src_rate > 192000:
+        raise ValueError('invalid_pcm_format')
+    if len(raw_bytes) & 1:
+        raw_bytes = raw_bytes[:-1]
+    a = array.array('h')
+    a.frombytes(raw_bytes)
+    if sys.byteorder != 'little':
+        a.byteswap()
+    n = len(a) // channels
+    if n == 0:
+        return array.array('f')
+    # Fast exact equivalent of the old linear interpolation for integer-ratio
+    # mono downsampling (48 kHz -> 16 kHz): old positions were 0, 3, 6...
+    # No new anti-aliasing is introduced here, so audio behavior stays the same.
+    if channels == 1 and src_rate % SAMPLE_RATE == 0:
+        factor = src_rate // SAMPLE_RATE
+        out_n = (n * SAMPLE_RATE) // src_rate
+        return array.array('f', (v / 32768.0 for v in a[:out_n*factor:factor]))
+    # Input is only used in max-300s voice notes.
+    if src_rate == SAMPLE_RATE:
+        return array.array('f', (sum(a[i*channels:(i+1)*channels]) / (channels*32768.0)
+                                  for i in range(n)))
+    out_n = int(n * SAMPLE_RATE / src_rate)
+    out = array.array('f', [0.0]) * out_n
+    for i in range(out_n):
+        pos = i * src_rate / SAMPLE_RATE
+        lower = int(pos)
+        hi = min(lower + 1, n-1)
+        frac = pos - lower
+        l = sum(a[lower*channels:(lower+1)*channels]) / (channels * 32768.0)
+        h = sum(a[hi*channels:(hi+1)*channels]) / (channels * 32768.0)
+        out[i] = l + (h-l)*frac
+    return out
+
+
+def _decode_wav(path):
+    import wave
+    with wave.open(path, 'rb') as reader:
+        if reader.getsampwidth() != 2:
+            raise ValueError('wav_requires_pcm16')
+        rate = reader.getframerate()
+        channels = reader.getnchannels()
+        frames = reader.readframes(MAX_AUDIO_SECS * rate + 1)
+    samples = _pcm16_resample(frames, channels, rate)
+    if len(samples) > MAX_AUDIO_SECS * SAMPLE_RATE:
+        raise ValueError('audio_too_long')
+    return samples, rate, channels
+
+
+def _decode_android(path, logger):
+    """Decode OGG/Opus using Android MediaExtractor + MediaCodec; no ffmpeg dependency.
+
+    This Java bridge must be validated on a real handset; android.codec output formats vary.
+    """
+    from java import jarray, jbyte
+    from android.media import MediaCodec, MediaExtractor, MediaFormat
+    extractor = MediaExtractor()
+    codec = None
+    try:
+        extractor.setDataSource(path)
+        idx = -1
+        fmt = None
+        for i in range(int(extractor.getTrackCount())):
+            f = extractor.getTrackFormat(i)
+            mime = str(f.getString(MediaFormat.KEY_MIME))
+            if mime.startswith('audio/'):
+                idx, fmt = i, f
+                break
+        if idx == -1:
+            raise ValueError('audio_track_missing')
+        extractor.selectTrack(idx)
+        codec = MediaCodec.createDecoderByType(str(fmt.getString(MediaFormat.KEY_MIME)))
+        codec.configure(fmt, None, None, 0)
+        codec.start()
+        info = MediaCodec.BufferInfo()
+        output = bytearray()
+        ended_input = False
+        ended_output = False
+        no_progress = 0
+        sr, channels = 0, 0
+        while not ended_output:
+            if not ended_input:
+                input_id = int(codec.dequeueInputBuffer(10000))
+                if input_id >= 0:
+                    inp = codec.getInputBuffer(input_id)
+                    inp.clear()
+                    size = int(extractor.readSampleData(inp, 0))
+                    if size < 0:
+                        codec.queueInputBuffer(input_id, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        ended_input = True
+                    else:
+                        codec.queueInputBuffer(input_id, 0, size, max(0, int(extractor.getSampleTime())), 0)
+                        extractor.advance()
+            out_id = int(codec.dequeueOutputBuffer(info, 10000))
+            if out_id >= 0:
+                if info.size > 0:
+                    out_format = codec.getOutputFormat()
+                    sr = int(out_format.getInteger(MediaFormat.KEY_SAMPLE_RATE))
+                    channels = int(out_format.getInteger(MediaFormat.KEY_CHANNEL_COUNT))
+                    pcm_fmt = int(out_format.getInteger('pcm-encoding')) if out_format.containsKey('pcm-encoding') else 2
+                    if pcm_fmt != 2:  # ENCODING_PCM_16BIT
+                        raise ValueError('unexpected_codec_pcm_encoding')
+                    buf = codec.getOutputBuffer(out_id)
+                    buf.position(info.offset)
+                    buf.limit(info.offset + info.size)
+                    jbytes = jarray(jbyte)(int(info.size))
+                    buf.get(jbytes)
+                    output.extend(bytes(jbytes))
+                    if len(output) > MAX_AUDIO_SECS * sr * channels * 2:
+                        raise ValueError('audio_too_long')
+                if info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM:
+                    ended_output = True
+                codec.releaseOutputBuffer(out_id, False)
+                no_progress = 0
+            elif out_id == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:
+                out_format = codec.getOutputFormat()
+                sr = int(out_format.getInteger(MediaFormat.KEY_SAMPLE_RATE))
+                channels = int(out_format.getInteger(MediaFormat.KEY_CHANNEL_COUNT))
+            else:
+                no_progress += 1
+                if no_progress > 2000:
+                    raise TimeoutError('media_codec_decode_stalled')
+        if not sr or not channels:
+            raise ValueError('missing_codec_format')
+        logger.info('ASR_DECODE_PCM src_rate=%s channels=%s pcm_bytes=%s', sr, channels, len(output))
+        resample_start = time.monotonic()
+        samples = _pcm16_resample(bytes(output), channels, sr)
+        logger.info('ASR_RESAMPLE_DONE ms=%s samples=%s',
+                    round(1000*(time.monotonic()-resample_start)), len(samples))
+        return samples, sr, channels
+    finally:
+        if codec is not None:
+            try: codec.stop()
+            except Exception: pass
+            try: codec.release()
+            except Exception: pass
+        try: extractor.release()
+        except Exception: pass
+
+
+def _decode_audio(path, logger):
+    t = time.monotonic()
+    with open(path,'rb') as f:
+        magic = f.read(12)
+    if magic.startswith(b'RIFF'):
+        samples, sr, ch = _decode_wav(path)
+        method = 'wav'
+    else:
+        samples, sr, ch = _decode_android(path, logger)
+        method = 'android_mediacodec'
+    if not samples:
+        raise ValueError('empty_audio')
+    logger.info('ASR_DECODE_DONE method=%s source_rate=%s channels=%s samples=%s duration_ms=%s decode_ms=%s',
+                method, sr, ch, len(samples), len(samples)*1000//SAMPLE_RATE,
+                round(1000*(time.monotonic()-t)))
+    return samples
+
+
+def _chunk_ranges(pcm, smart=True, target_sec=20, overlap_sec=0.7):
+    """Ranges over 16 kHz PCM. Search for a pause near each target boundary.
+
+    Overlap is applied only between chunks. Avoids cutting through speech where
+    a relatively quiet 200 ms region exists, otherwise falls back to nominal.
+    """
+    size = len(pcm)
+    target = int(target_sec * SAMPLE_RATE)
+    if size <= target:
+        return [(0, size)]
+    if not smart:
+        return [(i, min(size, i+target)) for i in range(0, size, target)]
+    overlap = int(overlap_sec * SAMPLE_RATE)
+    seek = 2 * SAMPLE_RATE
+    step = SAMPLE_RATE // 10  # 100 ms
+    win = SAMPLE_RATE // 5   # 200 ms
+    minimum = 12 * SAMPLE_RATE
+    chunks = []
+    begin = 0
+    # Guard prevents malformed inputs causing unbounded loops.
+    for _ in range(1 + size // minimum + 2):
+        desired = min(size, begin + target)
+        if size - desired < 3 * SAMPLE_RATE:
+            desired = size
+        if desired == size:
+            chunks.append((begin, size))
+            break
+        boundary = desired
+        candidate_scores = []
+        low = max(begin + minimum, desired - seek)
+        high = min(size - SAMPLE_RATE, desired + seek)
+        for at in range(low, high + 1, step):
+            # sparse 200ms absolute-amplitude measure; works without numpy
+            window = pcm[max(0, at-win//2):min(size, at+win//2):32]
+            if window:
+                energy = sum(abs(v) for v in window) / len(window)
+                candidate_scores.append((energy, abs(at-desired), at))
+        if candidate_scores:
+            energy, _, chosen = min(candidate_scores)
+            if energy < 0.015:
+                boundary = chosen
+        chunks.append((begin, boundary))
+        begin = max(boundary-overlap, begin+1)
+    else:
+        raise RuntimeError('chunk_plan_overflow')
+    return chunks
+
+
+def _normalized_token(token):
+    return re.sub(r'[^0-9a-zа-яё]+', '', token.casefold())
+
+
+def _join_chunk_text(left, right):
+    """Dedup only strong suffix/prefix word matches within a short overlap."""
+    if not left: return right.strip()
+    if not right: return left.strip()
+    prev, new = left.split(), right.split()
+    limit = min(12, len(prev), len(new))
+    shared = 0
+    for n in range(limit, 0, -1):
+        a = [_normalized_token(x) for x in prev[-n:]]
+        b = [_normalized_token(x) for x in new[:n]]
+        if a == b and all(a):
+            if n >= 2 or len(a[0]) >= 6:
+                shared = n
+                break
+    # If the overlap is fully duplicated, the latest transcript may consist
+    # entirely of already accepted tokens. Do not append them twice.
+    if shared:
+        new = new[shared:]
+    return ' '.join(prev + new).strip()
+
+
+def _normalize_unexpected_cyrillic_case(text):
+    """Conservatively fix bizarre mixed-case words; never touch acronyms."""
+    def fix(m):
+        word = m.group(0)
+        internal = sum(1 for ch in word[1:] if ch.isupper())
+        if internal < 2 or word.isupper():
+            return word
+        return word[0] + word[1:].lower()
+    return re.sub(r'[А-ЯЁа-яё]{4,}', fix, text)
+
+
+class _NativeTranscriber:
+    def __init__(self, path, logger):
+        self.logger = logger
+        self.path = path
+        self.lib = None
+        self.session = ctypes.c_void_p()
+        self.guard = threading.RLock()
+        self.loaded_model_path = None
+
+    def _open_library(self):
+        if self.lib: return
+        if not os.path.isfile(self.path):
+            raise FileNotFoundError('engine_not_installed')
+        directory = os.path.dirname(self.path)
+        # load dependencies in order, if they are dynamic dependencies of libtranscribe
+        for name in ('libggml-base.so', 'libggml-cpu.so', 'libggml.so'):
+            fn = os.path.join(directory, name)
+            if os.path.isfile(fn):
+                ctypes.CDLL(fn, mode=ctypes.RTLD_GLOBAL)
+        lib = ctypes.CDLL(self.path, mode=ctypes.RTLD_GLOBAL)
+        lib.transcribe_version.restype = ctypes.c_char_p
+        lib.transcribe_init_backends_default.argtypes = []
+        lib.transcribe_init_backends_default.restype = ctypes.c_int
+        lib.transcribe_open.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        lib.transcribe_open.restype = ctypes.c_int
+        lib.transcribe_run.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_void_p]
+        lib.transcribe_run.restype = ctypes.c_int
+        lib.transcribe_full_text.argtypes = [ctypes.c_void_p]
+        lib.transcribe_full_text.restype = ctypes.c_char_p
+        lib.transcribe_session_free.argtypes = [ctypes.c_void_p]
+        lib.transcribe_session_free.restype = None
+        lib.transcribe_status_string.argtypes = [ctypes.c_int]
+        lib.transcribe_status_string.restype = ctypes.c_char_p
+        version = lib.transcribe_version().decode('ascii', 'replace')
+        if not version.startswith('0.3.'):
+            raise RuntimeError('transcribe_incompatible_abi')
+        status = lib.transcribe_init_backends_default()
+        if status:
+            raise RuntimeError('backend_init_status_%s' % status)
+        self.lib = lib
+        self.logger.info('ASR_ENGINE_LOADED api_version=%s', version)
+
+    def _open_model(self, model_path):
+        self._open_library()
+        if self.session and self.loaded_model_path == model_path:
+            return
+        self.close()
+        _verify_model(model_path, full_hash=False)
+        t = time.monotonic()
+        session = ctypes.c_void_p()
+        ret = self.lib.transcribe_open(os.fsencode(model_path), None, None, ctypes.byref(session))
+        if ret or not session.value:
+            raise RuntimeError('model_load_status_%s' % ret)
+        self.session = session
+        self.loaded_model_path = model_path
+        self.logger.info('ASR_MODEL_LOADED ms=%s', round(1000*(time.monotonic()-t)))
+
+    def recognize(self, pcm, model_path, smart_chunks=True, fix_caps=True, model_id="ctc"):
+        with self.guard:
+            self._open_model(model_path)
+            texts = []
+            ranges = ([(0, len(pcm))] if model_id == 'whisper' else
+                      _chunk_ranges(pcm, smart=smart_chunks))
+            self.logger.info('ASR_CHUNK_PLAN mode=%s chunks=%s overlap_ms=%s',
+                             'whisper_internal_30s' if model_id == 'whisper' else ('silence_overlap' if smart_chunks else 'fixed'), len(ranges),
+                             0 if model_id == 'whisper' else (700 if smart_chunks else 0))
+            for i, (start, stop) in enumerate(ranges):
+                part = pcm[start:stop]
+                ptr = (ctypes.c_float * len(part)).from_buffer(part)
+                t = time.monotonic()
+                ret = self.lib.transcribe_run(self.session, ptr, len(part), None)
+                took = time.monotonic() - t
+                self.logger.info('ASR_INFER_CHUNK index=%s of=%s start_ms=%s end_ms=%s duration_ms=%s infer_ms=%s rtf=%.3f status=%s',
+                                 i+1, len(ranges), round(start*1000/SAMPLE_RATE), round(stop*1000/SAMPLE_RATE),
+                                 round(len(part)*1000/SAMPLE_RATE),round(took*1000),
+                                 took/max(len(part)/SAMPLE_RATE,0.001),ret)
+                if ret:
+                    err = self.lib.transcribe_status_string(ret)
+                    self.logger.warning('ASR_INFER_FAILURE code=%s name=%s', ret, (err or b'?').decode('ascii','replace')[:80])
+                    raise RuntimeError('infer_status_%s' % ret)
+                recognized = self.lib.transcribe_full_text(self.session)
+                value = (recognized or b'').decode('utf-8','replace').strip()
+                if value:
+                    prev = texts[-1] if texts else ''
+                    merged = _join_chunk_text(prev, value) if smart_chunks else (prev+' '+value).strip()
+                    if texts:
+                        texts[-1] = merged
+                    else:
+                        texts.append(merged)
+            output = ' '.join(texts).strip()
+            if fix_caps:
+                output = _normalize_unexpected_cyrillic_case(output)
+            return output
+
+    def close(self):
+        if self.session:
+            self.lib.transcribe_session_free(self.session)
+            self.session = ctypes.c_void_p()
+            self.loaded_model_path = None
+
+
+class _Monitor:
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self.guard = threading.Lock()
+        self.active = None
+        self.seq = 0
+        self.stopping = False
+
+    def begin(self, mode='vosk'):
+        with self.guard:
+            if self.stopping:
+                return False
+            if self.active is not None:
+                # Do not start unbounded sample threads during overlapping calls.
+                self.plugin.logger.warning('ASR_PERF_OVERLAP active_id=%s', self.active['id'])
+                return False
+            self.seq += 1
+            sid = self.seq
+            initial = _memory_sample(include_pss=True, include_system=True, include_power=True)
+            s = {'id': sid, 'mode': mode, 'start': initial,
+                 'last': initial, 'samples': 0, 'pss_peak': initial.get('pss_mb'),
+                 'rss_peak': initial.get('rss_mb'), 'cpu_peak_pct': 0.0,
+                 'audio_ms': None, 'audio_bytes': None,
+                 'event': threading.Event()}
+            self.active = s
+        self.plugin.logger.info('ASR_PERF_BEGIN %s', _fmt(dict(id=sid, mode=mode, **initial)))
+        thread = threading.Thread(target=self._watch, args=(s,), name='ASR-Perf-%s' % sid, daemon=True)
+        thread.start()
+        return True
+
+    def audio(self, path):
+        if not path:
+            return
+        try:
+            byte_count = os.stat(path).st_size
+        except (OSError, ValueError, TypeError):
+            byte_count = None
+        duration = _audio_duration_ms(path)
+        with self.guard:
+            s = self.active
+            if s:
+                s['audio_ms'] = duration
+                s['audio_bytes'] = byte_count
+                sid = s['id']
+            else:
+                return
+        self.plugin.logger.info('ASR_AUDIO_METADATA id=%s size_bytes=%s duration_ms=%s format=unknown_or_opus',
+                                sid, byte_count, duration)
+
+    def phase(self, label):
+        with self.guard:
+            s = self.active
+        if not s:
+            return
+        elapsed = 1000.0 * (_monotonic() - s['start']['mono'])
+        self.plugin.logger.info('ASR_PHASE id=%s name=%s elapsed_ms=%.1f', s['id'], label, elapsed)
+
+    def _watch(self, s):
+        last = s['start']
+        while not s['event'].wait(MONITOR_INTERVAL):
+            with self.guard:
+                if self.active is not s or self.stopping:
+                    return
+            row = _memory_sample(include_pss=True, include_system=(s['samples'] % 5 == 0),
+                                 include_power=(s['samples'] % 5 == 0))
+            wall = max(row['mono'] - last['mono'], 1e-6)
+            cpu_pct = 100.0 * max(0, row['cpu'] - last['cpu']) / wall
+            elapsed_ms = (row['mono'] - s['start']['mono']) * 1000.0
+            with self.guard:
+                if self.active is not s:
+                    return
+                s['samples'] += 1
+                for key, peak_key in [('pss_mb', 'pss_peak'), ('rss_mb', 'rss_peak')]:
+                    value = row.get(key)
+                    if value is not None:
+                        old = s[peak_key]
+                        s[peak_key] = value if old is None else max(old, value)
+                s['cpu_peak_pct'] = max(s['cpu_peak_pct'], cpu_pct)
+                s['last'] = row
+            self.plugin.logger.info('ASR_PERF_SAMPLE %s', _fmt(dict(id=s['id'], elapsed_ms=round(elapsed_ms),
+                                   cpu_pct_one_core=round(cpu_pct, 1), **{k:v for k,v in row.items() if k not in ('mono','cpu')})))
+            last = row
+            if elapsed_ms >= MONITOR_DEADLINE_SEC * 1000:
+                self.end('timeout_monitor_only')
+                return
+
+    def end(self, outcome):
+        with self.guard:
+            s = self.active
+            if s is None:
+                return
+            self.active = None
+            s['event'].set()
+        final = _memory_sample(include_pss=True, include_system=True, include_power=True)
+        wall_sec = max(final['mono'] - s['start']['mono'], 0.00001)
+        cpu_sec = max(final['cpu'] - s['start']['cpu'], 0.0)
+        wall_ms = wall_sec * 1000.0
+        end_to_end_rtf = (wall_ms / s['audio_ms']) if s['audio_ms'] else None
+        values = dict(id=s['id'], mode=s['mode'], outcome=outcome,
+                      wall_ms=round(wall_ms), cpu_ms=round(cpu_sec * 1000),
+                      cpu_pct_one_core=round(100 * cpu_sec / wall_sec, 1),
+                      cpu_peak_pct_one_core=round(s['cpu_peak_pct'], 1),
+                      audio_duration_ms=s['audio_ms'], end_to_end_rtf=round(end_to_end_rtf, 3) if end_to_end_rtf is not None else None,
+                      rss_begin_mb=s['start'].get('rss_mb'), rss_end_mb=final.get('rss_mb'),
+                      rss_peak_observed_mb=s['rss_peak'], vmhwm_mb=final.get('hwm_mb'),
+                      pss_begin_mb=s['start'].get('pss_mb'), pss_end_mb=final.get('pss_mb'),
+                      pss_peak_observed_mb=s['pss_peak'], samples=s['samples'],
+                      threads_end=final.get('threads'),
+                      battery_begin_pct=s['start'].get('battery_pct'), battery_end_pct=final.get('battery_pct'),
+                      thermal_begin=s['start'].get('thermal_status'),thermal_end=final.get('thermal_status'))
+        self.plugin.logger.info('ASR_PERF_SUMMARY %s', _fmt(values))
+        if s['mode'] == 'gigaam':
+            try:
+                with self.plugin.health_lock:
+                    info = dict(self.plugin.last_result)
+                if info:
+                    info.update(cpu_pct=values['cpu_pct_one_core'],
+                                rss_peak_mb=values['rss_peak_observed_mb'],
+                                pss_peak_mb=values['pss_peak_observed_mb'])
+                    self.plugin._save_last_result(info)
+            except Exception as e:
+                self.plugin.logger.warning('ASR_HEALTH_PERF_SAVE_FAILED type=%s',_short_exc(e))
+
+    def shutdown(self):
+        with self.guard:
+            self.stopping = True
+        self.end('plugin_unloaded')
+
+
+class _ObserveHook(MethodHook):
+    def __init__(self, plugin, label, terminal=False, audio=False):
+        self.plugin = plugin
+        self.label = label
+        self.terminal = terminal
+        self.is_audio = audio
+
+    def before_hooked_method(self, param):
+        try:
+            plugin = self.plugin
+            plugin.logger.info('ASR_EVENT %s', self.label)
+            if self.is_audio:
+                try:
+                    # recognize(String audioPath, String language, RecognitionCallback cb)
+                    if len(param.args) >= 2:
+                        threading.Thread(target=plugin.monitor.audio, args=(str(param.args[0]),), name='ASR-Audio-Metadata', daemon=True).start()
+                except Exception:
+                    plugin.logger.warning('ASR_AUDIO_METADATA_FAILED')
+            plugin.monitor.phase(self.label)
+        except Exception:
+            # Never interfere with AyuGram's original call.
+            pass
+
+    def after_hooked_method(self, param):
+        if self.terminal:
+            try:
+                self.plugin.monitor.end(self.label)
+            except Exception:
+                pass
+
+
+class _ControllerHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        p = self.plugin
+        try:
+            args = param.args
+            if len(args) != 5 or args[4] is None:
+                p.logger.warning('ASR_SKIP controller argc=%s invalid_or_null_callback', len(args))
+                return
+            if p.get_setting('enable_monitor', False):
+                p.monitor.begin(mode='test' if p.get_setting('inject_test_text', False) else 'vosk')
+                p.monitor.phase('controller.startRecognition')
+            if not p.get_setting('inject_test_text', False):
+                return
+            callback = args[4]
+
+            def deliver():
+                try:
+                    callback.onCompleted(TEST_TEXT)
+                    p.logger.info('ASR_TEST_DELIVERED')
+                    p.monitor.end('test_completed')
+                except Exception as e:
+                    p.logger.warning('ASR_TEST_ERROR type=%s', _short_exc(e))
+                    p.monitor.end('test_failed')
+                    try:
+                        from java.lang import Exception as JavaException
+                        callback.onError(JavaException('ASR probe callback failed'))
+                    except Exception:
+                        p.logger.warning('ASR_TEST_FALLBACK_ERROR')
+            # Only skip the original method after successful scheduling.
+            run_on_ui_thread(deliver)
+            param.setResult(None)
+            p.logger.info('ASR_TEST_INJECTED original_recognizer_skipped=True')
+        except Exception as e:
+            p.logger.warning('ASR_CONTROLLER_HOOK_FAILED type=%s', _short_exc(e))
+
+
+
+class _GigaAMRecognizerHook(MethodHook):
+    """Swap VoskRecognizer.recognize(audio_path, language, callback)."""
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        p = self.plugin
+        if not p.get_setting('enable_gigaam', False):
+            p.logger.info('ASR_BACKEND selected=vosk reason=disabled')
+            return
+        try:
+            args = param.args
+            if len(args) != 3 or args[0] is None or args[2] is None:
+                p.logger.warning('ASR_BACKEND selected=vosk reason=invalid_args argc=%s',len(args))
+                return
+            # Verified against VoskRecognizer Java implementation:
+            # recognize(String audioPath, String language, RecognitionCallback callback).
+            # v0.4.0 incorrectly treated args[1] (language, e.g. "ru") as the path.
+            path = str(args[0])
+            cb = args[2]
+            model_id = p._selected_model_id()
+            model_path = p._model_file(model_id)
+            engine_path = _default_engine_file()
+            if not os.path.isfile(engine_path) or not os.path.isfile(model_path):
+                p.logger.warning('ASR_BACKEND selected=vosk reason=artifact_missing engine=%s model=%s',
+                                 os.path.isfile(engine_path),os.path.isfile(model_path))
+                return
+            if not os.path.isfile(path):
+                # Preserve privacy: do not print filenames, URLs, chat IDs, or message IDs.
+                p.logger.warning('ASR_BACKEND selected=vosk reason=audio_file_missing arg_index=0 is_absolute=%s is_uri=%s',
+                                 os.path.isabs(path), '://' in path)
+                return
+            p.logger.info('ASR_AUDIO_READY source_arg=0 bytes=%s', os.path.getsize(path))
+            state = p._submit_gigaam((path, model_path, engine_path, cb, model_id))
+            if state == 'started' or state == 'queued':
+                # Both running and queued jobs are owned by GigaAM, never Vosk.
+                with p.monitor.guard:
+                    if p.monitor.active is not None:
+                        p.monitor.active['mode'] = 'gigaam'
+                param.setResult(None)
+                p.logger.info('ASR_BACKEND selected=gigaam state=%s original_vosk_skipped=True', state)
+            elif state == 'full':
+                # An explicit callback failure is better than silently switching
+                # the selected recognizer to Vosk when the queue is saturated.
+                param.setResult(None)
+                p._queue_error(cb, 'Очередь локального ASR переполнена')
+                p.logger.warning('ASR_QUEUE_FULL limit=%s', MAX_PENDING_ASR)
+            else:
+                p.logger.warning('ASR_BACKEND selected=vosk reason=worker_unavailable')
+        except Exception as e:
+            p.logger.warning('ASR_GIGAAM_HOOK_ERROR type=%s',_short_exc(e))
+
+def _message_audio_path(message):
+    """Resolve already-downloaded voice's original file, without cached transcript."""
+    owner = getattr(message, 'messageOwner', None)
+    if owner is None:
+        return None
+    candidates = []
+    try:
+        attach = str(getattr(owner, 'attachPath', '') or '')
+        if attach: candidates.append(attach)
+    except Exception: pass
+    try:
+        from org.telegram.messenger import FileLoader
+        loader = FileLoader.getInstance(int(message.currentAccount))
+        found = loader.getPathToMessage(owner)
+        if found is not None:
+            candidates.append(str(found.getAbsolutePath()))
+        try:
+            doc = owner.media.document
+            if doc is not None:
+                candidates.append(str(loader.getPathToAttach(doc).getAbsolutePath()))
+        except Exception: pass
+    except Exception: pass
+    for path in candidates:
+        if path and os.path.isfile(path) and os.path.getsize(path) > 100:
+            return path
+    return None
+
+
+class _ABCachedButtonHook(MethodHook):
+    """Observe transcribePressed(messageObject, open); never alter Telegram result."""
+    def __init__(self, plugin): self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        p = self.plugin
+        p.logger.info('ASR_EVENT button.transcribePressed')
+        if not p.get_setting('ab_mode', False): return
+        try:
+            args = param.args
+            if len(args) < 2 or not bool(args[1]) or args[0] is None:
+                return  # start only when expanding transcript, not collapsing it
+            msg = args[0]
+            owner = getattr(msg, 'messageOwner', None)
+            if owner is None: return
+            if not getattr(owner, 'voiceTranscriptionFinal', False):
+                p._notify('A/B: сначала выполни обычную транскрипцию этого голосового')
+                return
+            path = _message_audio_path(msg)
+            if not path:
+                p._notify('A/B: аудиофайл не найден. Сначала скачай или воспроизведи сообщение.')
+                p.logger.warning('ASR_AB_AUDIO_MISSING')
+                return
+            p._start_ab(path)
+        except Exception as e:
+            p.logger.warning('ASR_AB_TAP_FAIL type=%s',_short_exc(e))
+
+
+class AyuGramASRProbe(BasePlugin):
+    def on_plugin_load(self):
+        self.monitor = _Monitor(self)
+        self._registered = 0
+        self.gigaam_gate = threading.Lock()
+        self.gigaam_busy = False
+        self.pending_gigaam = deque()
+        self.unloading = False
+        self.gigaam_engine = None
+        self.health_lock = threading.RLock()
+        self.health_cache = {}
+        self.health_check_busy = False
+        self.model_download_status = 'Нет активной загрузки'
+        self.engine_download_status = 'Ожидание'
+        self.engine_download_active = False
+        self.model_download_active = False
+        self.ab_results = {}
+        self.ab_status = 'A/B ещё не запускался'
+        self.ab_last_audio = None  # in-memory only; never serialized
+        self.last_result = self._load_last_result()
+        self.logger.info('ASR_PROBE_LOADED version=0.7.0 default_mode=original_vosk queue_limit=%s', MAX_PENDING_ASR)
+        self._install('org.telegram.ui.Components.TranscribeButton', 'onTap', 'button.onTap')
+        # A/B mode is not hooked in the user release.
+        self._install('org.telegram.ui.Components.TranscribeButton', 'transcribeLocally', 'button.transcribeLocally')
+        self._install('com.exteragram.messenger.speech.VoiceRecognitionController',
+                      'startRecognition', 'controller.startRecognition', controller=True)
+        self._install('com.exteragram.messenger.speech.recognizers.VoskRecognizer',
+                      'recognize', 'vosk.recognize', gigaam=True)
+        # Completion is asynchronous; hook both possible observable terminal points.
+        self._install('org.telegram.ui.Components.TranscribeButton',
+                      'finishTranscription', 'button.finishTranscription', terminal=True)
+        for method in ('onCompleted', 'onError', 'onLanguageNotDownloaded', 'onLanguageNotSupported'):
+            self._install('com.exteragram.messenger.speech.VoiceRecognitionController$2',
+                          method, 'callback.' + method, terminal=True)
+        self.logger.info('ASR_PROBE_READY hook_groups=%s/10 monitor=1Hz', self._registered)
+
+    def _install(self, class_name, method_name, label, controller=False, terminal=False, audio=False, gigaam=False, ab_button=False):
+        try:
+            cls = find_class(class_name)
+            if cls is None:
+                self.logger.warning('ASR_HOOK_MISSING_CLASS label=%s', label)
+                return
+            hook = (_ABCachedButtonHook(self) if ab_button else (_ControllerHook(self) if controller else (_GigaAMRecognizerHook(self) if gigaam else _ObserveHook(self, label, terminal, audio))))
+            handles = self.hook_all_methods(cls, method_name, hook)
+            n = len(handles) if handles else 0
+            if n:
+                self._registered += 1
+                self.logger.info('ASR_HOOK_OK label=%s overloads=%s', label, n)
+            else:
+                self.logger.warning('ASR_HOOK_FAILED label=%s', label)
+        except Exception as e:
+            self.logger.warning('ASR_HOOK_EXCEPTION label=%s type=%s', label, _short_exc(e))
+
+    def _queue_error(self, callback, reason):
+        def deliver():
+            try:
+                from java.lang import Exception as JavaException
+                callback.onError(JavaException(reason))
+            except Exception as e:
+                self.logger.warning('ASR_QUEUE_CALLBACK_ERROR type=%s', _short_exc(e))
+        try:
+            run_on_ui_thread(deliver)
+        except Exception as e:
+            self.logger.warning('ASR_QUEUE_DISPATCH_ERROR type=%s', _short_exc(e))
+
+    def _launch_gigaam_task(self, task):
+        try:
+            threading.Thread(target=self._gigaam_worker, args=task,
+                             daemon=True, name='AyuGram-ASR-Queue-Worker').start()
+            return True
+        except Exception as e:
+            self.logger.warning('ASR_QUEUE_WORKER_FAILED type=%s', _short_exc(e))
+            return False
+
+    def _submit_gigaam(self, task):
+        # The GigaAM and Whisper sessions are shared: exactly one native job.
+        with self.gigaam_gate:
+            if self.unloading:
+                return 'disabled'
+            if self.gigaam_busy:
+                if len(self.pending_gigaam) >= MAX_PENDING_ASR:
+                    return 'full'
+                self.pending_gigaam.append((task, _monotonic()))
+                self.logger.info('ASR_QUEUE_ENQUEUED pending=%s model=%s',
+                                 len(self.pending_gigaam), task[4])
+                return 'queued'
+            self.gigaam_busy = True
+        if self._launch_gigaam_task(task):
+            self.logger.info('ASR_QUEUE_STARTED pending=0 model=%s', task[4])
+            return 'started'
+        self._finish_native_job()
+        return 'unavailable'
+
+    def _finish_native_job(self):
+        # Called only after UI callback delivery or after a completed A/B job.
+        # Keep busy=true while dispatching the next job so nothing races it.
+        while True:
+            with self.gigaam_gate:
+                if self.unloading or not self.pending_gigaam:
+                    self.gigaam_busy = False
+                    return
+                task, queued_at = self.pending_gigaam.popleft()
+                pending = len(self.pending_gigaam)
+            waited = _monotonic() - queued_at
+            if waited > MAX_QUEUE_WAIT_SEC:
+                self.logger.warning('ASR_QUEUE_EXPIRED wait_sec=%s pending=%s', round(waited), pending)
+                self._queue_error(task[3], 'Локальное распознавание: истекло время ожидания в очереди')
+                continue
+            self.logger.info('ASR_QUEUE_DEQUEUED pending=%s model=%s wait_ms=%s',
+                             pending, task[4], round(waited * 1000))
+            if self._launch_gigaam_task(task):
+                return
+            self._queue_error(task[3], 'Не удалось запустить локальное распознавание')
+
+    def _run_monitor(self, *args, **kwargs):
+        def worker():
+            self.logger.info('ASR_STANDALONE_MONITOR_BEGIN seconds=15')
+            if not self.monitor.begin(mode='idle_benchmark'):
+                self.logger.warning('ASR_STANDALONE_MONITOR_SKIPPED busy=True')
+                return
+            for _ in range(15):
+                with self.monitor.guard:
+                    s = self.monitor.active
+                if s is None:
+                    return
+                if s['event'].wait(1):
+                    return
+            self.monitor.end('idle_benchmark_done')
+        threading.Thread(target=worker, daemon=True, name='ASR-Monitor-Test').start()
+
+    def _native_check(self, *args, **kwargs):
+        threading.Thread(target=self._native_check_worker, daemon=True, name='ASR-Native-Check').start()
+
+    def _native_check_worker(self):
+        self.logger.info('ASR_NATIVE_BEGIN version=0.6.2 arch=%s ptr_bits=%s',
+                         platform.machine(), 8 * struct.calcsize('P'))
+        started = _monotonic()
+        self.logger.info('ASR_NATIVE_RESOURCE_BEGIN %s', _fmt(_memory_sample(True, True, True)))
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            ctx = ApplicationLoader.applicationContext
+            directory = os.path.join(str(ctx.getCodeCacheDir().getAbsolutePath()), 'ayugram_asr_probe')
+            os.makedirs(directory, exist_ok=True)
+            path = os.path.join(directory, 'libasr_probe_v03.so')
+            raw = base64.b64decode(NATIVE_LIB_BASE64)
+            if hashlib.sha256(raw).hexdigest() != NATIVE_LIB_SHA256:
+                raise ValueError('checksum')
+            tmp = path + '.tmp'
+            try:
+                if os.path.isfile(tmp):
+                    os.unlink(tmp)
+                with open(tmp, 'wb') as f:
+                    f.write(raw)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(tmp, 0o400)
+                os.replace(tmp, path)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            lib = ctypes.CDLL(path)
+            lib.asr_probe_answer.restype = ctypes.c_int
+            lib.asr_probe_banner.restype = ctypes.c_char_p
+            ok = (lib.asr_probe_answer() == 20261008 and
+                  lib.asr_probe_banner() == b'AYUGRAM_NATIVE_PROBE_OK')
+            self.logger.info('ASR_NATIVE_RESULT=%s elapsed_ms=%s', 'PASS' if ok else 'WRONG_SYMBOL_RESULT',
+                             int((_monotonic()-started)*1000))
+        except Exception as e:
+            self.logger.warning('ASR_NATIVE_RESULT=FAIL type=%s elapsed_ms=%s', _short_exc(e),
+                                int((_monotonic()-started)*1000))
+        self.logger.info('ASR_NATIVE_RESOURCE_END %s', _fmt(_memory_sample(True, True, True)))
+
+    def _check_model(self, *args, **kwargs):
+        """Never download or read model data; inspect only a small header."""
+        model = str(self.get_setting('model_file', '') or '').strip()
+        if not model:
+            self.logger.info('ASR_MODEL_CHECK missing_path=1 result=SKIP')
+            return
+        try:
+            st = os.stat(model)
+            with open(model, 'rb') as f:
+                header = f.read(4)
+            free_mb = os.statvfs(os.path.dirname(model) or '.').f_bavail * os.statvfs(os.path.dirname(model) or '.').f_frsize / MEGABYTE
+            self.logger.info('ASR_MODEL_CHECK result=%s size_mb=%.1f free_mb=%.0f',
+                             'GGUF_HEADER_OK' if header == b'GGUF' else 'BAD_HEADER',
+                             st.st_size / MEGABYTE, free_mb)
+        except Exception as e:
+            self.logger.warning('ASR_MODEL_CHECK result=FAIL type=%s', _short_exc(e))
+
+    def _check_engine(self, *args, **kwargs):
+        """Probe existing transcribe.cpp native artifact (not shipped in v0.3.0)."""
+        path = str(self.get_setting('engine_file', '') or '').strip()
+        if not path:
+            self.logger.info('ASR_ENGINE_CHECK result=NO_ENGINE_FILE version=0.6.2')
+            return
+        started = _monotonic()
+        try:
+            lib = ctypes.CDLL(path)
+            fun = lib.transcribe_version
+            fun.restype = ctypes.c_char_p
+            result = fun()
+            self.logger.info('ASR_ENGINE_CHECK result=LIBRARY_LOADS version=%s load_ms=%s',
+                             str(result.decode('ascii', 'replace'))[:60], int((_monotonic()-started)*1000))
+        except Exception as e:
+            self.logger.warning('ASR_ENGINE_CHECK result=FAIL type=%s load_ms=%s',
+                                _short_exc(e), int((_monotonic()-started)*1000))
+
+
+    def _gigaam_worker(self, path, model_path, engine_path, callback, model_id="ctc"):
+        started = _monotonic()
+        stage = 'audio_decode'
+        callback_scheduled = False
+        try:
+            with self.monitor.guard:
+                active_monitor = self.monitor.active is not None
+            if not active_monitor and self.get_setting('enable_monitor', False):
+                self.monitor.begin(mode='gigaam')
+            self.logger.info('ASR_GIGAAM_BEGIN model=%s', model_id)
+            self.monitor.audio(path)
+            self.monitor.phase('gigaam.native_worker_started')
+            self.logger.info('ASR_DECODE_BEGIN backend=android_mediacodec_or_wav')
+            pcm = _decode_audio(path, self.logger)
+            self.monitor.phase('gigaam.audio_decoded')
+            stage = 'native_init'
+            if self.gigaam_engine is None or self.gigaam_engine.path != engine_path:
+                self.gigaam_engine = _NativeTranscriber(engine_path,self.logger)
+            decode_duration = len(pcm)/SAMPLE_RATE
+            stage = 'inference'
+            t = _monotonic()
+            transcript = self.gigaam_engine.recognize(
+                pcm, model_path,
+                smart_chunks=(int(self.get_setting('chunk_mode', 0)) == 0),
+                fix_caps=bool(self.get_setting('normalize_caps', True)), model_id=model_id)
+            infer_ms = (_monotonic()-t)*1000
+            self.monitor.phase('gigaam.infer_done')
+            self.logger.info('ASR_GIGAAM_DONE model=%s words=%s chars=%s audio_sec=%.2f infer_ms=%s infer_rtf=%.3f total_ms=%s',
+                             model_id, len(transcript.split()),len(transcript), decode_duration,round(infer_ms),
+                             infer_ms/(decode_duration*1000),round(1000*(_monotonic()-started)))
+            if not transcript:
+                raise ValueError('empty_transcript')
+            self._save_last_result({
+                'ok': True, 'model':model_id, 'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'audio_sec': round(decode_duration, 1), 'total_sec': round((_monotonic()-started), 2),
+                'infer_rtf': round(infer_ms / (decode_duration*1000), 3),
+                'words': len(transcript.split()), 'error': ''})
+            stage = 'callback'
+            def deliver():
+                try:
+                    if self.unloading:
+                        self.logger.info('ASR_CALLBACK_SKIPPED reason=plugin_unloading')
+                        return
+                    callback.onCompleted(transcript)
+                    self.monitor.end('gigaam_completed')
+                except Exception as e:
+                    self.logger.warning('ASR_GIGAAM_CALLBACK_ERROR type=%s',_short_exc(e))
+                    self.monitor.end('gigaam_callback_error')
+                finally:
+                    self._finish_native_job()
+            run_on_ui_thread(deliver)
+            callback_scheduled = True
+        except Exception as e:
+            self._save_last_result({
+                'ok': False, 'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'error': '%s: %s' % (stage, _short_exc(e))})
+            self.logger.warning('ASR_GIGAAM_FAILED stage=%s type=%s reason=%s elapsed_ms=%s',stage,_short_exc(e),
+                                str(e) if isinstance(e,(ValueError,RuntimeError,FileNotFoundError)) else 'redacted',
+                                round(1000*(_monotonic()-started)))
+            def report_error():
+                try:
+                    if self.unloading:
+                        self.logger.info('ASR_CALLBACK_SKIPPED reason=plugin_unloading')
+                        return
+                    from java.lang import Exception as JavaException
+                    callback.onError(JavaException('GigaAM local inference failed'))
+                except Exception:
+                    self.logger.warning('ASR_GIGAAM_REPORT_ERROR')
+                finally:
+                    self.monitor.end('gigaam_error')
+                    self._finish_native_job()
+            try:
+                run_on_ui_thread(report_error)
+                callback_scheduled = True
+            except Exception:
+                self.monitor.end('gigaam_error_callback_failed')
+        finally:
+            if not callback_scheduled:
+                self._finish_native_job()
+
+    def _queue_state_message(self):
+        with self.gigaam_gate:
+            busy = self.gigaam_busy
+            pending = len(self.pending_gigaam)
+        return 'Локальный ASR: %s\nОжидают: %s\nЛимит очереди: %s\nМаксимальное ожидание: %s с\nКаждое сообщение обрабатывается последовательно.' % (
+            'выполняется инференс / A/B' if busy else 'ожидание', pending, MAX_PENDING_ASR, MAX_QUEUE_WAIT_SEC)
+
+    def _queue_state_click(self, *args, **kwargs):
+        self._show_health_dialog(self._queue_state_message())
+
+    def _selected_model_id(self):
+        try:
+            n = int(self.get_setting('active_model', 0))
+            return MODEL_ORDER[n] if 0 <= n < len(MODEL_ORDER) else 'ctc'
+        except (ValueError, TypeError): return 'ctc'
+
+    def _model_file(self, model_id):
+        override = str(self.get_setting('model_file','') or '').strip()
+        # Legacy custom override is only applicable to CTC.
+        return override if model_id == 'ctc' and override else _default_model_file(model_id)
+
+    def _model_size_valid(self,path,size):
+        try:
+            sp = MODEL_CATALOG[_model_id_for_path(path)]
+            return sp['min_mb']*1048576 <= size <= sp['max_mb']*1048576
+        except Exception: return False
+
+    def _download_ctc(self,*a,**k): return self._download_model_command('ctc')
+    def _download_rnnt(self,*a,**k): return self._download_model_command('rnnt')
+    def _download_whisper(self,*a,**k): return self._download_model_command('whisper')
+
+    def _start_ab(self,path):
+        with self.gigaam_gate:
+            if self.gigaam_busy:
+                self._notify('A/B: движок занят распознаванием, попробуй позже')
+                return
+            self.gigaam_busy = True
+        self.ab_last_audio = path
+        self.ab_status = 'Запущено сравнение трёх моделей…'
+        self.ab_results = {}
+        try:
+            threading.Thread(target=self._ab_worker,args=(path,),daemon=True,name='AyuGram-ASR-AB').start()
+        except Exception as e:
+            self.logger.warning('ASR_AB_THREAD_FAILED type=%s', _short_exc(e))
+            self._finish_native_job()
+            self._notify('A/B: не удалось запустить обработку')
+            return
+        self._notify('A/B начат: CTC → RNNT → Whisper. Оригинальное сообщение не изменяется.')
+
+    def _ab_worker(self,path):
+        """Decode ONCE, test three sequentially. No Telegram transcription cache involved."""
+        started = time.monotonic()
+        results = {}
+        self.monitor.begin(mode='ab')
+        self.monitor.audio(path)
+        try:
+            self.logger.info('ASR_AB_BEGIN candidates=3')
+            pcm = _decode_audio(path, self.logger)
+            duration = len(pcm) / SAMPLE_RATE
+            self.monitor.phase('ab.audio_decoded')
+            engine_path = str(self.get_setting('engine_file','') or '').strip() or _default_engine_file()
+            if self.gigaam_engine is None or self.gigaam_engine.path != engine_path:
+                self.gigaam_engine = _NativeTranscriber(engine_path,self.logger)
+            for model_id in MODEL_ORDER:
+                spec = MODEL_CATALOG[model_id]
+                model_path = self._model_file(model_id)
+                if not os.path.isfile(model_path):
+                    results[model_id] = {'ok':False,'error':'не установлена'}
+                    continue
+                self.ab_status = 'A/B: '+spec['name']
+                run_on_ui_thread(lambda notice=self.ab_status: self._notify(notice))
+                self.logger.info('ASR_AB_MODEL_BEGIN model=%s',model_id)
+                t = time.monotonic()
+                cpu_before = time.process_time()
+                rss_before = _kb_from_proc_status().get('VmRSS',0) / 1024.0
+                pss_before = _pss_kb()
+                try:
+                    text = self.gigaam_engine.recognize(
+                        pcm, model_path,
+                        smart_chunks=(int(self.get_setting('chunk_mode',0)) == 0),
+                        fix_caps=bool(self.get_setting('normalize_caps',True)),model_id=model_id)
+                    took = time.monotonic()-t
+                    cpu_ms = int((time.process_time()-cpu_before)*1000)
+                    rss_end = _kb_from_proc_status().get('VmRSS',0) / 1024.0
+                    pss_after = _pss_kb()
+                    pss_delta = round((pss_after - pss_before)/1024.0,1) if pss_before is not None and pss_after is not None else None
+                    results[model_id] = {'ok':True,'text':text,'seconds':round(took,2),
+                                         'rtf':round(took/max(duration,0.01),3),
+                                         'cpu_ms':cpu_ms, 'rss_delta_mb':round(rss_end-rss_before,1),
+                                         'pss_delta_mb':pss_delta}
+                    self.logger.info('ASR_AB_MODEL_DONE model=%s wall_ms=%s rtf=%.3f chars=%s cpu_ms=%s rss_delta_mb=%s pss_delta_mb=%s',
+                                     model_id,int(took*1000),took/max(duration,0.01),len(text),cpu_ms,
+                                     round(rss_end-rss_before,1),pss_delta)
+                    self.monitor.phase('ab.'+model_id+'.done')
+                except Exception as e:
+                    results[model_id] = {'ok':False,'error':_short_exc(e)}
+                    self.logger.warning('ASR_AB_MODEL_ERROR model=%s type=%s',model_id,_short_exc(e))
+                finally:
+                    # Don't retain all weights of three models in RAM.
+                    if self.gigaam_engine:
+                        self.gigaam_engine.close()
+            self.ab_results = results
+            self.ab_status = 'Завершено: %s/3 моделей' % sum(1 for r in results.values() if r['ok'])
+            self.logger.info('ASR_AB_DONE completed=%s total_ms=%s',
+                             sum(1 for r in results.values() if r['ok']),
+                             int((time.monotonic()-started)*1000))
+            self._show_health_dialog(self._ab_full_report())
+        except Exception as e:
+            self.ab_status = 'Ошибка A/B: '+_short_exc(e)
+            self.logger.warning('ASR_AB_FAILED type=%s',_short_exc(e))
+            self._show_health_dialog(self.ab_status)
+        finally:
+            self.monitor.end('ab_completed' if len(self.ab_results) else 'ab_error')
+            self._finish_native_job()
+
+    def _ab_summary(self):
+        lines = ['A/B · Результаты', self.ab_status,
+                 'Исходное голосовое можно воспроизводить как обычно. Кэш Telegram не менялся.']
+        for model_id in MODEL_ORDER:
+            r = self.ab_results.get(model_id)
+            if not r: continue
+            name = MODEL_CATALOG[model_id]['name']
+            if r.get('ok'):
+                lines.append('%s: %.2f с, RTF %.3f; CPU %.1f с, ΔRSS %s МБ, ΔPSS %s МБ; символов %s' %
+                             (name,r['seconds'],r['rtf'],r.get('cpu_ms',0)/1000.0,
+                              r.get('rss_delta_mb','?'),r.get('pss_delta_mb','?'),len(r.get('text',''))))
+            else:
+                lines.append('%s: %s' % (name,r.get('error','ошибка')))
+        lines.append('Тексты доступны ниже в настройках: «Текст CTC», «Текст RNNT», «Текст Whisper».')
+        return '\n'.join(lines)
+
+    def _ab_full_report(self):
+        lines = [self._ab_summary(), '', '—— ТЕКСТЫ ——']
+        for model_id in MODEL_ORDER:
+            r = self.ab_results.get(model_id)
+            if not r: continue
+            lines.append('\n'+MODEL_CATALOG[model_id]['name']+'\n'+
+                         ((r.get('text') or '(пусто)')[:6000] if r.get('ok')
+                           else '(не удалось: '+r.get('error','неизвестно')+')'))
+        return '\n'.join(lines)
+
+    def _ab_all_text_click(self,*a,**k):
+        self._show_health_dialog(self._ab_full_report())
+
+    def _ab_copy_report(self,*a,**k):
+        if not self.ab_results:
+            self._show_health_dialog('Сначала запусти A/B-тест.')
+            return
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            from android.content import ClipData, Context
+            ctx = ApplicationLoader.applicationContext
+            manager = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+            manager.setPrimaryClip(ClipData.newPlainText('AyuGram ASR A/B', self._ab_full_report()))
+            self._notify('Сравнение скопировано в буфер обмена')
+        except Exception as e:
+            self.logger.warning('ASR_AB_CLIPBOARD_FAILED type=%s',_short_exc(e))
+            self._show_health_dialog('Не удалось скопировать текст. См. «Все три текста».')
+
+    def _ab_summary_click(self,*a,**k): self._show_health_dialog(self._ab_summary())
+    def _ab_view(self, model_id):
+        r = self.ab_results.get(model_id)
+        if not r: self._show_health_dialog('Для этой модели ещё нет результата A/B'); return
+        msg = MODEL_CATALOG[model_id]['name']+'\n\n'
+        msg += r.get('text','(пусто)') if r.get('ok') else 'Ошибка: '+r.get('error','неизвестна')
+        self._show_health_dialog(msg)
+    def _ab_ctc(self,*a,**k): self._ab_view('ctc')
+    def _ab_rnnt(self,*a,**k): self._ab_view('rnnt')
+    def _ab_whisper(self,*a,**k): self._ab_view('whisper')
+    def _ab_repeat(self,*a,**k):
+        path=self.ab_last_audio
+        if not path or not os.path.isfile(path):
+            self._show_health_dialog('Нет доступного последнего голосового. В режиме A/B открой транскрипцию нужного сообщения.')
+            return
+        self._start_ab(path)
+
+    def _download_model_command(self,model_id='ctc',*args,**kwargs):
+        if model_id not in MODEL_CATALOG:
+            raise ValueError('unknown_model')
+        with self.health_lock:
+            if self.model_download_active:
+                self._show_health_dialog('Уже идёт загрузка. '+self.model_download_status)
+                return
+            self.model_download_active = True
+            self.model_download_status = model_id+': подготовка…'
+        def notify(message):
+            with self.health_lock:
+                self.model_download_status = model_id+': '+message
+        def go():
+            try:
+                self.logger.info('ASR_MODEL_DOWNLOAD_BEGIN model=%s',model_id)
+                _download_model(self.logger,self._model_file(model_id),notify=notify)
+                self._show_health_dialog(MODEL_CATALOG[model_id]['name']+' готова. SHA-256 проверена.')
+            except Exception as e:
+                notify('Ошибка: '+_short_exc(e))
+                self.logger.warning('ASR_MODEL_DOWNLOAD_FAIL model=%s type=%s',model_id,_short_exc(e))
+                self._show_health_dialog('Загрузка '+model_id+' прервана: '+_short_exc(e)+'\n'+('Скачанные части сохранены. Нажми «Скачать / докачать» повторно.' if os.path.isfile(self._model_file(model_id)+'.part') else 'Неполный файл не сохранился; при следующем запуске начнём сначала.'))
+            finally:
+                with self.health_lock:self.model_download_active=False
+        threading.Thread(target=go,daemon=True,name='ASR-Model-Downloader').start()
+        self._show_health_dialog('Загрузка / докачка '+MODEL_CATALOG[model_id]['name']+' запущена. Прогресс и повторы — в «Состояние».')
+
+
+    def _engine_install(self, *args, **kwargs):
+        if platform.machine().lower() not in ('aarch64', 'arm64'):
+            self._show_health_dialog('Нужен телефон ARM64. Эта сборка движка не совместима с устройством.')
+            return
+        with self.health_lock:
+            if self.engine_download_active:
+                self._show_health_dialog(self.engine_download_status)
+                return
+            self.engine_download_active = True
+            self.engine_download_status = 'Подготовка загрузки…'
+        self._show_health_dialog('Установка запущена. Движок (~12 МиБ) скачивается из GitHub Releases. Оставь AyuGram открытым.')
+        try:
+            threading.Thread(target=self._engine_install_worker,
+                             name='AyuGram-ASR-Engine-Installer',daemon=True).start()
+        except Exception as e:
+            with self.health_lock:
+                self.engine_download_active = False
+                self.engine_download_status = 'Ошибка запуска'
+            self._show_health_dialog('Не удалось запустить установщик: '+_short_exc(e))
+
+    def _engine_install_worker(self):
+        def status(message):
+            with self.health_lock:
+                self.engine_download_status = message
+        started = time.monotonic()
+        reserved_native_job = False
+        try:
+            root = _engine_root()
+            os.makedirs(root, mode=0o700, exist_ok=True)
+            status('Получаем контрольную сумму из GitHub Releases…')
+            expected = _read_release_sha256(ENGINE_RELEASE_URL)
+            archive = os.path.join(root, ENGINE_ASSET)
+            status('Скачивание архива…')
+            _download_engine_archive(ENGINE_RELEASE_URL, archive, expected, notify=status)
+            # Never replace an engine while a transcription is running.
+            with self.gigaam_gate:
+                if self.gigaam_busy or self.unloading:
+                    raise RuntimeError('engine_busy_try_again_later')
+                self.gigaam_busy = True
+                reserved_native_job = True
+            status('Проверяем и устанавливаем библиотеки…')
+            def verify_native(path):
+                nonlocal engine
+                status('Проверка загрузки libtranscribe.so…')
+                engine = _NativeTranscriber(path, self.logger)
+                engine._open_library()  # Check all linked dependencies and actual C ABI.
+            engine = None
+            _install_engine_archive(archive, root, expected, notify=status,
+                                    load_validator=verify_native)
+            status('Движок установлен и проверен: '+ENGINE_TAG)
+            self.logger.info('ASR_ENGINE_INSTALL_OK version=%s elapsed_ms=%s',
+                             ENGINE_TAG, int((time.monotonic()-started)*1000))
+            self._show_health_dialog('Движок успешно установлен без root.\nВерсия: '+ENGINE_TAG+
+                                     '\nNative API: '+engine.lib.transcribe_version().decode('ascii','replace')+
+                                     '\nТеперь скачай RNNT и включи локальный ASR.')
+        except Exception as e:
+            status('Ошибка установки: ' + _short_exc(e))
+            self.logger.warning('ASR_ENGINE_INSTALL_FAILED type=%s', _short_exc(e))
+            self._show_health_dialog('Не удалось установить движок.\n'+_short_exc(e)+
+                                     ': '+str(e)[:220]+
+                                     '\nЕсли GitHub Release ещё не опубликован, сначала запусти сборку в Actions.')
+        finally:
+            with self.health_lock:
+                self.engine_download_active = False
+            if reserved_native_job:
+                self._finish_native_job()
+
+    def _ui_model_status(self, model_id):
+        sp = MODEL_CATALOG[model_id]
+        path = self._model_file(model_id)
+        selected = (self._selected_model_id() == model_id)
+        active = ' · выбрана' if selected else ''
+        try:
+            size = os.path.getsize(path)
+            if not self._model_size_valid(path, size):
+                return '⚠ '+sp['name']+' · неполный файл'+active, 'Нажми для проверки / переустановки'
+            with open(path, 'rb') as inp:
+                valid = inp.read(4) == b'GGUF'
+            if not valid:
+                return '⚠ '+sp['name']+' · неверный формат'+active, 'Нажми для повторной загрузки'
+            if sp['sha256'] is None and not os.path.isfile(path+'.sha256'):
+                return '⚠ '+sp['name']+' · не проверена'+active, 'Не найдена контрольная сумма; нажми для загрузки'
+            return '✓ '+sp['name']+' · %.0f МиБ%s' % (size / 1048576, active), 'Установлена на устройстве'
+        except OSError:
+            part = path + '.part'
+            if os.path.isfile(part):
+                return '↓ '+sp['name']+' · не завершена'+active, 'Часть скачана; нажми для продолжения'
+            return '○ '+sp['name']+active, 'Не загружена · нажми для скачивания'
+
+    def _ui_model_tap(self, model_id):
+        title, note = self._ui_model_status(model_id)
+        if title.startswith('✓'):
+            self._show_health_dialog(title+'\n'+note+'\nВыбор активной модели — над списком.')
+        else:
+            self._download_model_command(model_id)
+
+    def _ui_ctc(self,*a,**k): self._ui_model_tap('ctc')
+    def _ui_rnnt(self,*a,**k): self._ui_model_tap('rnnt')
+    def _ui_whisper(self,*a,**k): self._ui_model_tap('whisper')
+
+    def _remove_selected_model(self,*a,**k):
+        model_id = self._selected_model_id()
+        def confirm_dialog():
+            try:
+                from client_utils import get_last_fragment
+                from ui.alert import AlertDialogBuilder
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+                if activity is None: raise RuntimeError('no_activity')
+                d = AlertDialogBuilder(activity)
+                d.set_title('Удалить модель?')
+                d.set_message(MODEL_CATALOG[model_id]['name']+' будет удалена с устройства. Её можно будет скачать заново.')
+                d.set_negative_button('Отмена', lambda dlg, which: dlg.dismiss())
+                d.set_positive_button('Удалить', lambda dlg, which: threading.Thread(
+                    target=self._remove_model_worker, args=(model_id,),
+                    daemon=True, name='ASR-Delete-Model').start())
+                d.show()
+            except Exception as e:
+                self.logger.warning('ASR_MODEL_DELETE_DIALOG_FAIL type=%s', _short_exc(e))
+                self._show_health_dialog('Не удалось открыть подтверждение удаления.')
+        run_on_ui_thread(confirm_dialog)
+
+    def _remove_model_worker(self, model_id):
+        # Avoid deleting an actively mapped GGUF or a file currently downloading.
+        with self.gigaam_gate:
+            if self.gigaam_busy:
+                self._show_health_dialog('Сейчас идёт распознавание. Повтори удаление позже.')
+                return
+            self.gigaam_busy = True
+        try:
+            with self.health_lock:
+                if self.model_download_active:
+                    self._show_health_dialog('Дождись завершения скачивания.')
+                    return
+            if self.gigaam_engine is not None:
+                with self.gigaam_engine.guard:
+                    self.gigaam_engine.close()
+            path = self._model_file(model_id)
+            for fn in (path, path+'.sha256', path+'.part'):
+                if os.path.isfile(fn): os.unlink(fn)
+            self._show_health_dialog('Модель удалена: '+MODEL_CATALOG[model_id]['name']+
+                                     '\nДля обновления списка открой настройки плагина заново.')
+        except Exception as e:
+            self._show_health_dialog('Ошибка удаления модели: '+_short_exc(e))
+        finally:
+            self._finish_native_job()
+
+    def _check_artifacts(self,*args,**kwargs):
+        threading.Thread(target=self._check_artifacts_worker,daemon=True,name='ASR-Artifacts-Check').start()
+
+    def _check_artifacts_worker(self):
+        try:
+            engine_path=_default_engine_file()
+            model_path=str(self.get_setting('model_file','') or '').strip() or _default_model_file()
+            if os.path.isfile(model_path):
+                self.logger.info('ASR_ARTIFACT_MODEL exists=True bytes=%s sha_status=HEADER_ONLY',_verify_model(model_path))
+            else: self.logger.info('ASR_ARTIFACT_MODEL exists=False')
+            if os.path.isfile(engine_path):
+                engine=self.gigaam_engine or _NativeTranscriber(engine_path,self.logger)
+                engine._open_library()
+                self.logger.info('ASR_ARTIFACT_ENGINE result=LOADED')
+            else: self.logger.info('ASR_ARTIFACT_ENGINE result=MISSING')
+        except Exception as e:
+            self.logger.warning('ASR_ARTIFACT_CHECK_FAILED type=%s',_short_exc(e))
+
+    def _release_model(self,*args,**kwargs):
+        with self.gigaam_gate:
+            if self.gigaam_busy:
+                self.logger.warning('ASR_RELEASE_SKIPPED busy=1')
+                return
+        if self.gigaam_engine:
+            with self.gigaam_engine.guard:
+                self.gigaam_engine.close()
+            self.logger.info('ASR_MODEL_RELEASED')
+
+    def _state_path(self):
+        return os.path.join(_context_files_dir(), 'asr_gigaam', 'last_result.json')
+
+    def _load_last_result(self):
+        try:
+            with open(self._state_path(), 'r', encoding='utf-8') as stream:
+                obj = json.load(stream)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_last_result(self, state):
+        # Only aggregate timing/error type, never transcripts, paths or chat ids.
+        with self.health_lock:
+            self.last_result = state
+        try:
+            dest = self._state_path()
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            tmp = dest + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as out:
+                json.dump(state, out, ensure_ascii=False)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp, dest)
+        except Exception as e:
+            self.logger.warning('ASR_HEALTH_SAVE_FAILED type=%s', _short_exc(e))
+
+    def _paths(self):
+        model = self._model_file(self._selected_model_id())
+        engine = _default_engine_file()
+        return model, engine
+
+    def _quick_health(self):
+        try:
+            model, engine = self._paths()
+            model_good = os.path.isfile(model)
+            model_bytes = os.stat(model).st_size if model_good else 0
+            return {'engine_exists': os.path.isfile(engine),
+                    'model_exists': model_good and self._model_size_valid(model,model_bytes),
+                    'model_mb': round(model_bytes/1048576, 1),
+                    'enabled': bool(self.get_setting('enable_gigaam',False)),
+                    'busy': bool(self.gigaam_busy),
+                    'loaded': bool(self.gigaam_engine and self.gigaam_engine.session and self.gigaam_engine.session.value and self.gigaam_engine.loaded_model_path == model)}
+        except Exception:
+            return {'engine_exists': False,'model_exists':False,'enabled':False,'busy':False,'loaded':False}
+
+    def _health_message(self, deep=False):
+        q = self._quick_health()
+        with self.health_lock:
+            cache = dict(self.health_cache)
+            last = dict(self.last_result)
+            dl = self.model_download_status
+        lines = [
+            'Режим: ' + ('Локальный ASR включён' if q['enabled'] else 'Vosk (локальный ASR выключен)'),
+            'Выбрана: '+MODEL_CATALOG[self._selected_model_id()]['name'],
+            'Движок: ' + ('файл найден' if q['engine_exists'] else 'не установлен'),
+            'Модель: ' + ('найдена (%.1f МБ)' % q['model_mb'] if q['model_exists'] else 'не найдена'),
+            'Сейчас: ' + ('идёт распознавание' if q['busy'] else 'ожидание'),
+            'Модель в памяти: ' + ('да' if q['loaded'] else 'нет'),
+            'Загрузка: ' + dl,
+        ]
+        if cache:
+            lines += ['Последняя проверка: '+cache.get('time','—'),
+                      'Engine API: '+cache.get('engine','не проверен'),
+                      'Модель SHA-256: '+cache.get('model','не проверена'),
+                      'Инициализация модели: '+cache.get('model_load','не проверялась')]
+        elif deep:
+            lines.append('Полная проверка ещё не запускалась.')
+        if last:
+            if last.get('ok'):
+                lines += ['Последний инференс: УСПЕШНО ('+last.get('time','')+')',
+                          'Модель: '+str(last.get('model','ctc')),
+                          'Аудио: %s с, обработка: %s с, infer RTF: %s' % (
+                           last.get('audio_sec','?'),last.get('total_sec','?'),last.get('infer_rtf','?'))]
+                if 'cpu_pct' in last:
+                    lines += ['CPU: %s%% одного ядра; пик RSS: %s МБ; пик PSS: %s МБ' % (
+                        last.get('cpu_pct'),last.get('rss_peak_mb','?'),last.get('pss_peak_mb','?'))]
+            else:
+                lines += ['Последний инференс: ОШИБКА ('+last.get('time','')+')',
+                          'Этап: '+last.get('error','неизвестен')]
+        else:
+            lines += ['Инференс ещё не выполнялся (или нет сохранённых данных).']
+        return '\n'.join(lines)
+
+    def _notify(self, message):
+        try:
+            from ui.bulletin import BulletinHelper
+            BulletinHelper.show_info(message)
+        except Exception:
+            self.logger.info('ASR_UI_NOTICE %s', message[:100])
+
+    def _show_health_dialog(self, message):
+        """Visible on-device; gracefully fall back to SDK bulletins."""
+        def show():
+            try:
+                from client_utils import get_last_fragment
+                from ui.alert import AlertDialogBuilder
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+                if activity is None:
+                    raise RuntimeError('no_activity')
+                dialog = AlertDialogBuilder(activity)
+                dialog.set_title('AyuGram ASR')
+                dialog.set_message(message)
+                dialog.set_positive_button('Понятно', lambda b, w: b.dismiss())
+                dialog.show()
+            except Exception as e:
+                try:
+                    from ui.bulletin import BulletinHelper
+                    BulletinHelper.show_info(message[:220])
+                except Exception:
+                    self.logger.warning('ASR_UI_STATUS_FAILED type=%s',_short_exc(e))
+        try:
+            run_on_ui_thread(show)
+        except Exception as e:
+            self.logger.warning('ASR_UI_DISPATCH_FAILED type=%s',_short_exc(e))
+
+    def _show_health(self, *args, **kwargs):
+        self._show_health_dialog(self._health_message())
+
+    def _check_health(self, load_model=False):
+        with self.health_lock:
+            if getattr(self,'health_check_busy',False):
+                self._show_health_dialog('Проверка уже выполняется.')
+                return
+            self.health_check_busy = True
+        self._notify('Проверка GigaAM запущена…')
+        def worker():
+            cache = {'time':time.strftime('%Y-%m-%d %H:%M:%S'),
+                     'model':'не найдена','engine':'не найден','model_load':'не проверялась'}
+            temporarily_busy = False
+            try:
+                model_path, engine_path = self._paths()
+                try:
+                    if os.path.isfile(model_path):
+                        _verify_model(model_path, full_hash=True)
+                        cache['model'] = 'SHA-256 OK'
+                except Exception as e:
+                    cache['model'] = 'ОШИБКА: '+_short_exc(e)
+                try:
+                    if os.path.isfile(engine_path):
+                        # Do not race native library initialization or model loading
+                        # against the existing worker. Busy is a simple soft gate.
+                        with self.gigaam_gate:
+                            if not self.gigaam_busy:
+                                self.gigaam_busy = True
+                                temporarily_busy = True
+                        if not temporarily_busy:
+                            cache['engine'] = 'Проверка отложена: идёт распознавание'
+                            cache['model_load'] = 'занято'
+                        else:
+                            engine = (self.gigaam_engine if self.gigaam_engine is not None
+                                      and self.gigaam_engine.path == engine_path
+                                      else _NativeTranscriber(engine_path, self.logger))
+                            with engine.guard:
+                                engine._open_library()
+                                cache['engine'] = str(engine.lib.transcribe_version().decode('ascii','replace'))
+                                if load_model and cache['model'] == 'SHA-256 OK':
+                                    engine._open_model(model_path)
+                                    cache['model_load'] = 'УСПЕШНО'
+                                    if self.gigaam_engine is None:
+                                        self.gigaam_engine = engine
+                except Exception as e:
+                    if cache['engine'] == 'не найден':
+                        cache['engine'] = 'ОШИБКА: '+_short_exc(e)
+                    else:
+                        cache['model_load'] = 'ОШИБКА: '+_short_exc(e)
+            except Exception as e:
+                self.logger.warning('ASR_HEALTH_CHECK_FAILED type=%s',_short_exc(e))
+            finally:
+                if temporarily_busy:
+                    self._finish_native_job()
+                with self.health_lock:
+                    self.health_cache = cache
+                    self.health_check_busy = False
+                self.logger.info('ASR_HEALTH_RESULT engine=%s model=%s load=%s',
+                                 cache['engine'], cache['model'], cache['model_load'])
+                self._show_health_dialog(self._health_message(deep=True))
+        threading.Thread(target=worker,daemon=True,name='ASR-Health-Check').start()
+
+    def _check_health_fast(self,*args,**kwargs):
+        self._check_health(load_model=False)
+
+    def _check_health_model_load(self,*args,**kwargs):
+        self._check_health(load_model=True)
+
+    def _advanced_settings(self):
+        return [
+            Header(text='Дополнительные настройки'),
+            Input(key='engine_file',text='Путь к движку .so (необязательно)',default='',
+                  subtext='Пусто = стандартный code_cache/asr_engine/libtranscribe.so'),
+            Input(key='model_file',text='Путь к GGUF (необязательно)',default='',
+                  subtext='Пусто = стандартный files/asr_gigaam/*.gguf'),
+            Switch(key='enable_monitor', text='Подробные логи CPU/RAM/PSS (~1 Гц)', default=True),
+            Text(text='Освободить модель из памяти',on_click=self._release_model),
+            Text(text='Проверить наличие файлов (Logcat)',on_click=self._check_artifacts),
+            Text(text='Тест мониторинга на 15 секунд',on_click=self._run_monitor),
+            Text(text='Проверка ARM64-загрузки (старый тест)',on_click=self._native_check),
+            Switch(key='inject_test_text',text='Вернуть TEST-текст вместо распознавания',default=False),
+            Text(text='Тег Logcat: plugin.ayugram_asr_probe'),
+        ]
+
+    def create_settings(self):
+        q = self._quick_health()
+        installed = sum(1 for k in MODEL_ORDER if self._ui_model_status(k)[0].startswith('✓'))
+        with self.health_lock:
+            engine_status = self.engine_download_status
+            model_status = self.model_download_status
+        selected = MODEL_CATALOG[self._selected_model_id()]['name']
+        title = ('Готово к работе' if q['engine_exists'] and q['model_exists']
+                 else 'Нужно установить движок / модель')
+        rows = [
+            Header(text='AyuGram ASR · v0.7.0'),
+            Text(text='Состояние: '+title,
+                 subtext='Выбрана: '+selected+' · '+('локальный режим' if q['enabled'] else 'Vosk'),
+                 on_click=self._show_simple_status),
+            Switch(key='enable_gigaam', text='Локальная расшифровка', default=False,
+                   subtext='Выкл. — штатное распознавание AyuGram (Vosk)'),
+            Header(text='Движок'),
+            Text(text=('✓ Установлен · '+_engine_current_version() if q['engine_exists'] else '○ Не установлен'),
+                 subtext=('Нативный движок доступен' if q['engine_exists'] else
+                          'Для нового телефона установка выполняется здесь, без ADB и root'),
+                 on_click=self._show_simple_status),
+            Text(text='Установить / восстановить движок',
+                 subtext=('Последнее действие: '+engine_status), on_click=self._engine_install),
+            Header(text='Модели · установлено %s из %s' % (installed,len(MODEL_ORDER))),
+            Selector(key='active_model',text='Использовать модель',default=1,
+                     items=[MODEL_CATALOG[k]['name'] for k in MODEL_ORDER]),
+        ]
+        for key, handler in [('rnnt',self._ui_rnnt),('ctc',self._ui_ctc),('whisper',self._ui_whisper)]:
+            name, subtext = self._ui_model_status(key)
+            rows.append(Text(text=name,subtext=subtext,on_click=handler))
+        rows.extend([
+            Text(text='Загрузка моделей', subtext=model_status, on_click=self._show_simple_status),
+            Text(text='Удалить выбранную модель', subtext='С подтверждением перед удалением',
+                 on_click=self._remove_selected_model),
+            Header(text='Распознавание'),
+            Text(text='Очередь: %s ждут' % len(self.pending_gigaam),
+                 subtext='Несколько голосовых распознаются последовательно',
+                 on_click=self._queue_state_click),
+            Selector(key='chunk_mode',text='Нарезка GigaAM',default=0,
+                     items=['По паузам + перекрытие','Строго по 20 секунд']),
+            Switch(key='normalize_caps',text='Исправлять случайные заглавные буквы',default=True),
+        ])
+        return rows
+
+    def _show_simple_status(self,*args,**kwargs):
+        q = self._quick_health()
+        state = ('Установлен · '+_engine_current_version() if q['engine_exists'] else 'Не установлен')
+        rows = ['Движок: '+state,
+                'Выбрана: '+MODEL_CATALOG[self._selected_model_id()]['name'],
+                'Модель найдена: '+('да' if q['model_exists'] else 'нет'),
+                'Режим: '+('локальный ASR' if q['enabled'] else 'Vosk'),
+                'Очередь: '+str(len(self.pending_gigaam)),
+                'Загрузка движка: '+self.engine_download_status,
+                'Загрузка модели: '+self.model_download_status]
+        self._show_health_dialog('\n'.join(rows))
+
+
+    def on_plugin_unload(self):
+        with self.gigaam_gate:
+            self.unloading = True
+            abandoned = list(self.pending_gigaam)
+            self.pending_gigaam.clear()
+            is_busy = self.gigaam_busy
+        # During plugin teardown the Java callback owner may already be
+        # invalid. Do not dispatch Java UI callbacks from a stopped plugin.
+        self.logger.info('ASR_QUEUE_SHUTDOWN abandoned=%s active_native=%s',len(abandoned),is_busy)
+        try:
+            self.monitor.shutdown()
+        except Exception:
+            pass
+        # Never free a native model while an inference could still be running.
+        if not is_busy and self.gigaam_engine:
+            try:
+                with self.gigaam_engine.guard:
+                    self.gigaam_engine.close()
+            except Exception as e:
+                self.logger.warning('ASR_UNLOAD_RELEASE_FAILED type=%s', _short_exc(e))
+        self.logger.info('ASR_PROBE_UNLOADED version=0.7.0')
