@@ -1356,20 +1356,11 @@ class AyuGramASRProbe(BasePlugin):
         self.ab_last_audio = None  # in-memory only; never serialized
         self.last_result = self._load_last_result()
         self.logger.info('ASR_PROBE_LOADED version=0.7.0 default_mode=original_vosk queue_limit=%s', MAX_PENDING_ASR)
-        self._install('org.telegram.ui.Components.TranscribeButton', 'onTap', 'button.onTap')
-        # A/B mode is not hooked in the user release.
-        self._install('org.telegram.ui.Components.TranscribeButton', 'transcribeLocally', 'button.transcribeLocally')
-        self._install('com.exteragram.messenger.speech.VoiceRecognitionController',
-                      'startRecognition', 'controller.startRecognition', controller=True)
+        # User release: one hook is enough. Do not leave the old TEST injection,
+        # A/B replay, or diagnostic observer hooks running after upgrade.
         self._install('com.exteragram.messenger.speech.recognizers.VoskRecognizer',
                       'recognize', 'vosk.recognize', gigaam=True)
-        # Completion is asynchronous; hook both possible observable terminal points.
-        self._install('org.telegram.ui.Components.TranscribeButton',
-                      'finishTranscription', 'button.finishTranscription', terminal=True)
-        for method in ('onCompleted', 'onError', 'onLanguageNotDownloaded', 'onLanguageNotSupported'):
-            self._install('com.exteragram.messenger.speech.VoiceRecognitionController$2',
-                          method, 'callback.' + method, terminal=True)
-        self.logger.info('ASR_PROBE_READY hook_groups=%s/10 monitor=1Hz', self._registered)
+        self.logger.info('ASR_READY hooks=%s telemetry=disabled', self._registered)
 
     def _install(self, class_name, method_name, label, controller=False, terminal=False, audio=False, gigaam=False, ab_button=False):
         try:
@@ -1550,7 +1541,7 @@ class AyuGramASRProbe(BasePlugin):
         try:
             with self.monitor.guard:
                 active_monitor = self.monitor.active is not None
-            if not active_monitor and self.get_setting('enable_monitor', False):
+            if not active_monitor and False:  # Remove persisted telemetry toggle from older builds
                 self.monitor.begin(mode='gigaam')
             self.logger.info('ASR_GIGAAM_BEGIN model=%s', model_id)
             self.monitor.audio(path)
@@ -1635,9 +1626,9 @@ class AyuGramASRProbe(BasePlugin):
 
     def _selected_model_id(self):
         try:
-            n = int(self.get_setting('active_model', 0))
-            return MODEL_ORDER[n] if 0 <= n < len(MODEL_ORDER) else 'ctc'
-        except (ValueError, TypeError): return 'ctc'
+            n = int(self.get_setting('active_model', 1))
+            return MODEL_ORDER[n] if 0 <= n < len(MODEL_ORDER) else 'rnnt'
+        except (ValueError, TypeError): return 'rnnt'
 
     def _model_file(self, model_id):
         override = str(self.get_setting('model_file','') or '').strip()
