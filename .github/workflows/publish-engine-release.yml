@@ -1,0 +1,43 @@
+name: Publish verified Android ARM64 engine
+on:
+  push:
+    paths:
+      - .github/workflows/publish-engine-release.yml
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout packaging code
+        uses: actions/checkout@v4
+      - name: Download existing successful Android build (2026-10-08)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p android-engine-arm64
+          gh run download 37757454335 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name ayugram-transcribe-android-arm64 \
+            --dir android-engine-arm64
+      - name: Verify binaries and generate deterministic release ZIP
+        run: |
+          python3 scripts/package-engine-release.py android-engine-arm64 engine-arm64-v8a.zip
+          echo '8f310e6c89e924550715e4d16a5459478999bbee707d546f102a66ccbeeb55e9  engine-arm64-v8a.zip' | sha256sum --check
+      - name: Publish permanent GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view engine-v1.0.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'engine-v1.0.0 already exists; refusing to overwrite a pinned asset.'
+            exit 0
+          fi
+          gh release create engine-v1.0.0 \
+            engine-arm64-v8a.zip engine-arm64-v8a.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title 'AyuGram ASR Engine v1.0.0 (Android ARM64)' \
+            --notes 'Android ARM64, API 26+, CPU inference. transcribe.cpp commit 95d82e5134fba4b18ad6a46f3baf950f53bcfc3b. Built by GitHub Actions run 37757454335 on 2026-10-08. SHA-256 pinned in plugin v0.7.0. No models bundled.'
