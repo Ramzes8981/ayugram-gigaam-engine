@@ -1,0 +1,199 @@
+"""AyuGram Native Loader Test. Self-contained, offline, no root or ADB.
+
+Writes a verified ARM64 test shared library into AyuGram's own code_cache,
+makes the file read-only and tests loading it through ctypes.CDLL().
+It does NOT install the full ASR engine.
+"""
+import base64
+import ctypes
+import hashlib
+import os
+import platform
+import stat
+import threading
+import time
+
+from base_plugin import BasePlugin
+from ui.settings import Header, Text
+from android_utils import run_on_ui_thread
+
+__id__ = "ayugram_native_loader_test"
+__name__ = "ASR Native Loader Test"
+__description__ = "Проверка загрузки ARM64 .so без root и ADB"
+__author__ = "AyuGram ASR test"
+__version__ = "0.1.0"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+_PROBE_BASE64 = "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AgAAAAAAAABIAgAAAAAAAEgCAAAAAAAAJAAAAAAAAAABAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAATAAAABQAAAAIAAAAAAAAAbAIAAAAAAABsAgAAAAAAACAAAAAAAAAAAQAAAAAAAAAEAAAAAAAAAAQAAAAAAAAAGQAAAAMAAAACAAAAAAAAAIwCAAAAAAAAjAIAAAAAAAAzAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAACEAAAABAAAAMgAAAAAAAAC/AgAAAAAAAL8CAAAAAAAAGAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAQAAAAAAAAApAAAAAQAAAAIAAAAAAAAA2AIAAAAAAADYAgAAAAAAABwAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAANwAAAAEAAAACAAAAAAAAAPgCAAAAAAAA+AIAAAAAAABEAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAEEAAAABAAAABgAAAAAAAAA8QwAAAAAAADwDAAAAAAAAGAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAABHAAAABgAAAAMAAAAAAAAAWIMAAAAAAABYAwAAAAAAAKAAAAAAAAAABAAAAAAAAAAIAAAAAAAAABAAAAAAAAAAUAAAAAgAAAADAAAAAAAAAPiDAAAAAAAA+AMAAAAAAAAIDAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAF8AAAABAAAAMAAAAAAAAAAAAAAAAAAAAPgDAAAAAAAA2wAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAQAAAAAAAABoAAAAAgAAAAAAAAAAAAAAAAAAAAAAAADYBAAAAAAAANgAAAAAAAAADgAAAAcAAAAIAAAAAAAAABgAAAAAAAAAcAAAAAMAAAAAAAAAAAAAAAAAAAAAAAAAsAUAAAAAAACCAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAHoAAAADAAAAAAAAAAAAAAAAAAAAAAAAADIGAAAAAAAARwAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAA="
+_PROBE_SHA256 = "206d2b6702a0789b14b93e98b30e5bc143f9c575d8b8080c98c46d0d3c1bbca3"
+_EXPECTED_BANNER = b"AYUGRAM_NATIVE_PROBE_OK"
+_EXPECTED_ANSWER = 20261008
+
+
+class NativeLoaderTest(BasePlugin):
+    def on_plugin_load(self):
+        self._guard = threading.Lock()
+        self._running = False
+        self._last_result = "Тест ещё не запускался."
+        self.logger.info("ASR_LOADER_TEST_READY version=0.1.0")
+
+    def create_settings(self):
+        return [
+            Header(text="Проверка нативных библиотек без root"),
+            Text(
+                text="Запустить проверку ARM64 .so",
+                subtext="Офлайн-тест: запись → SHA-256 → только чтение → ctypes.CDLL → вызов функции",
+                on_click=self._run,
+            ),
+            Text(
+                text="Показать результат последней проверки",
+                on_click=self._show_last_result,
+            ),
+            Text(
+                text="Ничего не меняет в рабочем ASR; модель и движок не скачивает.",
+            ),
+        ]
+
+    def _show(self, message):
+        def ui():
+            try:
+                from client_utils import get_last_fragment
+                from ui.alert import AlertDialogBuilder
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else None
+                if activity is None:
+                    raise RuntimeError("No active AyuGram activity")
+                dialog = AlertDialogBuilder(activity)
+                dialog.set_title("ASR · проверка загрузки .so")
+                dialog.set_message(message)
+                dialog.set_positive_button("Закрыть", lambda d, which: d.dismiss())
+                dialog.show()
+            except Exception as exc:
+                try:
+                    from ui.bulletin import BulletinHelper
+                    BulletinHelper.show_info(message[:220])
+                except Exception:
+                    self.logger.warning("ASR_LOADER_TEST_UI_FAIL error=%s",
+                                        type(exc).__name__)
+        run_on_ui_thread(ui)
+
+    def _show_last_result(self, *args, **kwargs):
+        self._show(self._last_result)
+
+    def _run(self, *args, **kwargs):
+        with self._guard:
+            if self._running:
+                self._show("Проверка уже выполняется.")
+                return
+            self._running = True
+        self._show("Проверка запущена. Результат появится автоматически.")
+        try:
+            threading.Thread(
+                target=self._worker, name="ASR-Native-Loader-Test", daemon=True
+            ).start()
+        except Exception:
+            with self._guard:
+                self._running = False
+            self._show("Не удалось запустить тест.")
+
+    def _worker(self):
+        started = time.monotonic()
+        lines = []
+        stage = "initialization"
+        try:
+            from org.telegram.messenger import ApplicationLoader
+            ctx = ApplicationLoader.applicationContext
+            if ctx is None:
+                raise RuntimeError("applicationContext is null")
+
+            package_name = str(ctx.getPackageName())
+            if package_name != "com.radolyn.ayugram":
+                lines.append("Пакет: " + package_name)
+            else:
+                lines.append("Пакет: AyuGram")
+
+            machine = platform.machine().lower()
+            lines.append("Архитектура: " + machine)
+            if machine not in ("aarch64", "arm64"):
+                raise RuntimeError("Для теста требуется Android ARM64")
+
+            stage = "decode-and-verify"
+            raw = base64.b64decode(_PROBE_BASE64)
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest != _PROBE_SHA256:
+                raise ValueError("Неверная SHA-256 встроенной библиотеки")
+            lines.append("SHA-256 библиотеки: OK")
+
+            stage = "write-to-app-code-cache"
+            root_dir = str(ctx.getCodeCacheDir().getAbsolutePath())
+            directory = os.path.join(root_dir, "ayugram_native_loader_test")
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            os.chmod(directory, 0o700)
+            path = os.path.join(directory, "libasr_probe_v03.so")
+
+            if not os.path.isfile(path) or self._file_sha(path) != _PROBE_SHA256:
+                temp = path + ".partial"
+                try:
+                    if os.path.lexists(temp):
+                        os.unlink(temp)
+                    with open(temp, "wb") as stream:
+                        stream.write(raw)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.chmod(temp, 0o400)
+                    os.replace(temp, path)
+                finally:
+                    if os.path.lexists(temp):
+                        os.unlink(temp)
+
+            stage = "permissions"
+            os.chmod(path, 0o400)
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            lines.append("Файл в code_cache: OK")
+            lines.append("Права файла: %04o" % mode)
+            if mode != 0o400:
+                raise RuntimeError("Библиотека не стала read-only")
+
+            stage = "ctypes-CDLL"
+            lib = ctypes.CDLL(path)
+            lines.append("ctypes.CDLL: OK")
+
+            stage = "symbol-call"
+            lib.asr_probe_answer.argtypes = []
+            lib.asr_probe_answer.restype = ctypes.c_int
+            lib.asr_probe_banner.argtypes = []
+            lib.asr_probe_banner.restype = ctypes.c_char_p
+            answer = lib.asr_probe_answer()
+            banner = lib.asr_probe_banner()
+            if answer != _EXPECTED_ANSWER or banner != _EXPECTED_BANNER:
+                raise RuntimeError("Неверный результат тестовой функции")
+            lines.append("Вызов функций .so: OK")
+            lines.append("")
+            lines.append("УСПЕХ: загрузка ARM64 .so из приватного каталога работает.")
+            self.logger.info("ASR_LOADER_TEST_PASS stage=symbol-call")
+        except Exception as exc:
+            lines.append("")
+            lines.append("ОШИБКА на этапе: " + stage)
+            lines.append(type(exc).__name__ + ": " + str(exc)[:320])
+            self.logger.warning("ASR_LOADER_TEST_FAIL stage=%s error=%s",
+                                stage, type(exc).__name__)
+        finally:
+            lines.append("")
+            lines.append("Время: %d мс" % int((time.monotonic() - started) * 1000))
+            lines.append("Это тест загрузчика, а не полной модели RNNT.")
+            self._last_result = "\n".join(lines)
+            with self._guard:
+                self._running = False
+            try:
+                self._show(self._last_result)
+            except Exception:
+                self.logger.warning("ASR_LOADER_TEST_RESULT_UI_DISPATCH_FAIL")
+
+    @staticmethod
+    def _file_sha(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(65536), b""):
+                digest.update(block)
+        return digest.hexdigest()
